@@ -1,0 +1,52 @@
+graph TD
+    subgraph L5_User_Interface [L5: Human-OS Interface]
+        User((User)) <--> CLI[Rust-based CLI / Daemon Controller]
+    end
+
+    subgraph L4_Meta_Orchestration [L4: Orchestration Meta-Agent]
+        MetaAgent[Meta-Agent: Synthesizer]
+        GoalAnalytic[Goal Decomposition & Gap Identification]
+        MetaAgent --- GoalAnalytic
+    end
+
+    subgraph L3_Semantic_Context [L3: Semantic Context Layer - Blackboard]
+        direction TB
+        State[(Current State JSON)]
+        Gaps{Identified Gaps List}
+        PulseStatus[Agent Status Table: Ready/Working/Done]
+        State --- Gaps --- PulseStatus
+    end
+
+    subgraph L2_Agent_Workforce [L2: Expert Agents - Thread Bound]
+        direction LR
+        NetworkPulse[Network Pulse: Web/API/MCP]
+        MachinePulse[Machine Pulse: Local Syscalls]
+        NetworkPulse --- AgentMD_N[Agents.md: Network Guardrails]
+        MachinePulse --- AgentMD_M[Agents.md: Machine Guardrails]
+    end
+
+    subgraph L1_Durable_Memory [L1: Durable Artifact Store - The Living Memory]
+        direction TB
+        L1_Cache[Thin Active Cache: KV-Cache Logits]
+        L2_Store[(Durable Store: Crystallized JSON Memories)]
+        VectorDB[ChromaDB: Semantic Indexing]
+        L2_Store --- VectorDB
+    end
+
+    subgraph L0_Hardware [L0: Hardware Layer - Data Sovereignty]
+        RTX4090[NVIDIA RTX 4090 - vLLM/Ollama Backend]
+        LocalDisk[Local Disk Storage]
+    end
+
+    %% Flow Logic
+    CLI -->|Intent| MetaAgent
+    MetaAgent -->|1. Semantic Retrieval| VectorDB
+    VectorDB -->|2. Populate context| State
+    MetaAgent -->|3. Post Gaps| Gaps
+    Gaps -->|4. Parallel Pull| NetworkPulse
+    Gaps -->|4. Parallel Pull| MachinePulse
+    NetworkPulse -->|5. Evidence| State
+    MachinePulse -->|5. Evidence| State
+    State -->|6. If Task Done| Crystallize[Knowledge Crystallization]
+    Crystallize -->|7. Summarize & Store| L2_Store
+    Crystallize -->|8. Fresh Start| MetaAgent
