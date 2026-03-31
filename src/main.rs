@@ -1,5 +1,7 @@
 use moss::providers::remote::openrouter::OpenRouter;
 use moss::providers::{DynProvider, Message, Role};
+use moss::moss::orchestrator::Orchestrator;
+use moss::moss::blackboard::Blackboard;
 
 #[tokio::main]
 async fn main() {
@@ -15,6 +17,8 @@ async fn main() {
             std::process::exit(1);
         }
     };
+
+    let orchestrator = Orchestrator::new(provider);
 
     use tokio::io::{self, AsyncBufReadExt, BufReader};
 
@@ -34,9 +38,8 @@ async fn main() {
                     continue;
                 }
 
-                let msgs = vec![Message { role: Role::User, content: input.to_string().into_boxed_str() }];
-                let resp = provider.complete_chat(msgs).await;
-                println!("=> {}", resp);
+                let resp = orchestrator.synthesize(input, &Blackboard::new()).await;
+                // println!("=> {}", resp);
             }
             Ok(None) => break, // EOF
             Err(e) => {

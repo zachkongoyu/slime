@@ -1,2 +1,2 @@
 pub mod blackboard;
-pub mod synthesizer;
+pub mod orchestrator;

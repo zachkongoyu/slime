@@ -58,7 +58,7 @@ impl Evidence {
 }
 
 #[derive(serde::Serialize)]
-pub(in crate::moss) struct Blackboard {
+pub struct Blackboard {
     intent: Option<Box<str>>,
     /// evidences keyed by `gap_id` (single evidence per gap)
     evidences: DashMap<uuid::Uuid, Evidence>,
@@ -67,7 +67,7 @@ pub(in crate::moss) struct Blackboard {
 }
 
 impl Blackboard {
-    pub(in crate::moss) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             intent: None,
             evidences: DashMap::new(),

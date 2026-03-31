@@ -20,8 +20,8 @@ pub struct Message {
 }
 
 #[async_trait]
-pub trait LlmProvider: Send + Sync {
-    async fn complete_chat(&self, messages: Vec<Message>) -> Value;
+pub trait Provider: Send + Sync {
+    async fn complete_chat(&self, messages: Vec<Message>) -> String;
 }
 
-pub type DynProvider = Box<dyn LlmProvider>;
+pub type DynProvider = Box<dyn Provider>;
