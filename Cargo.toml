@@ -5,24 +5,12 @@ edition = "2021"
 description = "A decentralized, parallel-thinking organism framework."
 
 [dependencies]
-# The Nervous System: Multithreaded runtime for parallel pulses
 tokio = { version = "1.43", features = ["full"] }
-
-# The Cytosol: Blazing fast concurrent memory for the Lattice
 dashmap = { version = "6.1", features = ["serde"] }
-
-# The DNA: Robust serialization for stateless JSON nutrients
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-
-# The Nucleus: Async OpenAI integration for thinking units
-# "full" includes chat, streaming, and function calling (tools)
-async-openai = "0.33"
-
-# The Flagella: For the Tool (Organelle) layer
 reqwest = { version = "0.12", features = ["json"] } # For web search
-sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "sqlite"] } # For SQL tool
-
-# The Flow: Shared traits across pulses
 async-trait = "0.1"
 uuid = { version = "1.0", features = ["serde", "v4"] }
+thiserror = "1"
+minijinja = "2"
