@@ -1,16 +1,16 @@
+use std::sync::Arc;
+
+use moss::Moss;
 use moss::providers::remote::openrouter::OpenRouter;
-use moss::providers::{DynProvider, Message, Role};
-use moss::moss::orchestrator::Orchestrator;
-use moss::moss::blackboard::Blackboard;
 
 #[tokio::main]
 async fn main() {
     println!("Moss CLI — simple interactive shell");
 
-    let provider: DynProvider = match OpenRouter::new(None, None) {
+    let provider = match OpenRouter::new(None, None) {
         Ok(p) => {
             println!("Using OpenRouter provider");
-            Box::new(p) as DynProvider
+            Arc::new(p)
         }
         Err(e) => {
             eprintln!("Provider not configured: {}. Exiting.", e);
@@ -18,19 +18,18 @@ async fn main() {
         }
     };
 
-    let orchestrator = Orchestrator::new(provider);
+    let moss = Moss::new(provider);
 
     use tokio::io::{self, AsyncBufReadExt, BufReader};
-
     let stdin = io::stdin();
     let mut lines = BufReader::new(stdin).lines();
 
-    println!("Chat loop: type messages and press Enter to send. Type 'exit' to quit.");
+    println!("Chat loop: type a message and press Enter. Type 'exit' to quit.");
 
     loop {
         match lines.next_line().await {
             Ok(Some(raw)) => {
-                let input = raw.trim_end();
+                let input = raw.trim_end().to_string();
                 if input == "exit" || input == "quit" {
                     break;
                 }
@@ -38,12 +37,14 @@ async fn main() {
                     continue;
                 }
 
-                let resp = orchestrator.synthesize(input, &Blackboard::new()).await;
-                // println!("=> {}", resp);
+                match moss.run(&input).await {
+                    Ok(msg) => println!("{msg}"),
+                    Err(e) => eprintln!("error: {e}"),
+                }
             }
-            Ok(None) => break, // EOF
+            Ok(None) => break,
             Err(e) => {
-                eprintln!("stdin error: {}", e);
+                eprintln!("stdin error: {e}");
                 break;
             }
         }

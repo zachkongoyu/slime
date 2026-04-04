@@ -21,7 +21,11 @@ pub fn load_dotenv(dotenv_path: Option<&Path>) {
 				let key: &str = k.trim();
 				let value = v.trim().trim_matches('"').trim_matches('\'');
 				if !key.is_empty() && std::env::var_os(key).is_none() {
-					std::env::set_var(key, value);
+					// Rust 2024 requires explicit acknowledgement that mutating process
+					// environment is unsafe and must happen during controlled startup.
+					unsafe {
+						std::env::set_var(key, value);
+					}
 				}
 			}
 		}

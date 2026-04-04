@@ -48,7 +48,7 @@ The user-facing surface. Currently a minimal async CLI (`tokio::io::BufReader` o
 
 | Sub-component | Status | Notes |
 |---|---|---|
-| CLI input loop | `PARTIAL` | `main.rs` — reads lines, passes to Orchestrator. Response output is commented out (`// println!`); loop runs but does not display results to the user. |
+| CLI input loop | `IMPLEMENTED` | `main.rs` — reads lines, passes to `Moss::run`, prints response. |
 | HUD delta streamer | `PLANNED` | Requires Blackboard change notification (see Section 5.2) |
 
 **L4 — Orchestrator** `PARTIAL`
@@ -56,8 +56,9 @@ The strategic coordinator. Receives user intent, queries Memory for relevant con
 
 | Sub-component | Status | Notes |
 |---|---|---|
-| Intent-to-DAG decomposition (single LLM call) | `PARTIAL` | `orchestrator.rs` — the `synthesize` method sends the query + Blackboard state to the LLM and parses the JSON response, but there is no separate `decompose` method yet. The result is written to `output.json` but not fed back into the Blackboard. |
-| Execution loop (poll, dispatch, evidence, synthesis) | `PLANNED` | Core runtime — see Section 3 |
+| Intent-to-DAG decomposition (single LLM call) | `IMPLEMENTED` | `orchestrator.rs` — `decompose` renders `prompts/decompose.md` via `minijinja`, calls LLM, deserializes into `Decomposition`. `Moss::run` inserts gaps into Blackboard. |
+| Response synthesis (Evidence → answer) | `PARTIAL` | `orchestrator.rs` — `synthesize` renders `prompts/synthesize.md` and calls LLM, but Evidence is a placeholder until Runner is implemented. |
+| Execution loop (poll, dispatch, evidence, synthesis) | `PLANNED` | Core runtime — see Section 3. Requires Runner. |
 | Context injection (M1/M3 retrieval before planning) | `PLANNED` | — |
 
 **L3 — Blackboard** `PARTIAL`
@@ -65,9 +66,9 @@ Moss-managed task memory using `DashMap` for lock-free concurrent access. Holds 
 
 | Sub-component | Status | Notes |
 |---|---|---|
-| Data structures (Gap, Evidence, Blackboard) | `IMPLEMENTED` | `blackboard.rs` |
-| Insert/mutate operations | `IMPLEMENTED` | `insert_gap`, `set_gap_state`, `insert_evidence` |
-| Dependency resolution (auto-unblock) | `PLANNED` | Scheduler needs to watch for resolved deps |
+| Data structures (Gap, Evidence, Blackboard) | `IMPLEMENTED` | `blackboard.rs` — `GapState`, `GapType`, `Gap`, `EvidenceStatus`, `Evidence`, `Blackboard` with private fields and `pub(crate)` getters |
+| Insert/mutate operations | `IMPLEMENTED` | `insert_gap`, `set_gap_state`, `append_evidence`, `insert_gate`, `set_intent` |
+| Dependency resolution (auto-unblock) | `IMPLEMENTED` | `promote_unblocked`, `drain_ready`, `all_closed`, `all_gated_or_closed` — unit tested |
 | Change notification (for HUD) | `PLANNED` | `tokio::broadcast` or watch channel |
 
 **L2 — Compiler & Executor** `PLANNED`
@@ -276,109 +277,61 @@ pub async fn execute(&self, plan: Plan, blackboard: Arc<Blackboard>) -> Result<(
 
 **Responsibility:** Translate user intent into a Gap DAG; drive the execution loop; synthesize the final response.
 
-**Current state:** A single method `synthesize` exists in `orchestrator.rs`. It loads the `orchestrator.xml` prompt, substitutes `{user_query}` and `{blackboard_state}` via `str::replace`, sends one LLM call, parses the JSON response, and writes it to `output.json`. It does not insert Gaps into the Blackboard, does not run an execution loop, and does not produce a user-facing response (the method returns a `serde_json::Value` that is currently unused in `main.rs`). There is no separate `decompose` or `synthesize` method — the current code conflates both into one function.
+**Current state:** `decompose` and `synthesize` are separate methods. `decompose` renders `prompts/decompose.md` via `minijinja`, calls the LLM, and deserializes the response into a `Decomposition` struct. `synthesize` renders `prompts/synthesize.md` and calls the LLM, but Evidence is a placeholder until the Runner is implemented. Gap insertion into the Blackboard happens in `Moss::run` after `decompose` returns.
 
 **Current interface (as-built):**
 
 ```rust
-pub struct Orchestrator {
-    provider: DynProvider, // Box<dyn Provider>, not Arc
-}
-
-impl Orchestrator {
-    pub fn new(provider: DynProvider) -> Self;
-    pub async fn synthesize(&self, query: &str, blackboard: &Blackboard) -> Value;
-}
-```
-
-**Target interface (to be implemented):**
-
-```rust
-/// Plans only. Translates intent into a Gap DAG and synthesizes the final response.
-/// Does not own or drive the execution loop.
-pub struct Orchestrator {
+pub(crate) struct Orchestrator {
     provider: Arc<dyn Provider>,
-    memory: Arc<MemoryManager>,
 }
 
 impl Orchestrator {
-    /// Step 3 only: intent -> Gap DAG
-    async fn decompose(
-        &self,
-        query: &str,
-        session_ctx: &[Message],
-        crystals: &[Crystal],
-        blackboard: &Blackboard,
-    ) -> Result<Plan>;
-
-    /// Step 6 only: all Evidence -> final answer.
-    /// Only reads the latest Evidence record per gap. For gaps with
-    /// EvidenceStatus::Success, that is the canonical result.
-    /// For gaps with EvidenceStatus::Partial or Failure, the summary
-    /// is included so the synthesizing LLM can acknowledge partial or
-    /// failed information rather than silently omitting it.
-    async fn synthesize(&self, blackboard: &Blackboard) -> Result<String>;
-}
-
-/// Owns the JoinSet execution loop. Drives Gaps from Ready to Closed.
-pub struct Runner {
-    compiler: Arc<Compiler>,
-    executor: Arc<Executor>,
-    defense_claw: Arc<DefenseClaw>,
-}
-
-impl Runner {
-    /// Insert plan into Blackboard, then execute all Gaps to completion.
-    pub async fn execute(&self, plan: Plan, blackboard: Arc<Blackboard>) -> Result<()>;
+    pub(crate) fn new(provider: Arc<dyn Provider>) -> Self;
+    pub(crate) async fn decompose(&self, query: &str, blackboard: &Blackboard) -> Result<Decomposition, MossError>;
+    pub(crate) async fn synthesize(&self, blackboard: &Blackboard) -> Result<String, MossError>;
 }
 ```
 
-The entry point in `main.rs` constructs both and calls them in sequence:
+**Target interface (pending Runner):**
 
 ```rust
-let plan = orchestrator.decompose(query, &ctx, &crystals, &blackboard).await?;
-runner.execute(plan, blackboard.clone()).await?;
-let response = orchestrator.synthesize(&blackboard).await?;
+pub(crate) struct Orchestrator {
+    provider: Arc<dyn Provider>,
+    memory: Arc<MemoryManager>,  // added when Memory is implemented
+}
 ```
 
-**Prompt contract (`orchestrator.xml`):**
-The Orchestrator sends the user query and serialized Blackboard state to the LLM. The LLM returns a JSON object with `intent` (string) and `gaps` (array). Each gap has: `name` (snake_case slug, unique), `question` (the atomic task description), `type` (PROACTIVE or REACTIVE), and `dependencies` (list of gap names from the same plan).
+`decompose` will gain `session_ctx` and `crystals` parameters when Memory is implemented. `synthesize` will read real Evidence from the Blackboard once the Runner populates it.
 
-**Constraints the prompt enforces:**
-- No meta-tasks (no gaps for "understand the query" or "plan the approach").
-- If the Blackboard already contains enough information, return `"gaps": []`.
-- If the query is nonsensical, return `"intent": null, "gaps": null`.
+**Prompt contract:**
+- `prompts/decompose.md` — Markdown instructions + XML-tagged input (`{{ user_query }}`, `{{ blackboard_state }}`). LLM returns JSON: `{ intent, gaps[] }`. Each gap: `name` (snake_case), `description`, `gap_type` (Proactive|Reactive), `dependencies`, `constraints`, `expected_output`.
+- `prompts/synthesize.md` — Markdown instructions + XML-tagged input (`{{ intent }}`, `{{ evidence }}`). LLM returns a plain text response.
 
-**Issue to resolve:** The current prompt uses `{user_query}` and `{blackboard_state}` template placeholders replaced via `str::replace`. This is fragile — a user query containing the literal string `{blackboard_state}` would break rendering. Replace with a proper templating approach (e.g., `minijinja` or structured XML injection with escaping).
-
-### 4.2 Blackboard `PARTIAL`
+### 4.2 Blackboard `IMPLEMENTED`
 
 **Responsibility:** Moss-managed task memory for one conversation round. Holds the Gap DAG, Evidence map, and HITL Gates. Moss creates a Blackboard when a new gap-resolution round begins, keeps it active through any multi-turn HITL interactions (Gated approvals), and crystallizes it when all Gaps are terminal. Closed Blackboards are immutable — never reopened; the next user turn creates a new Blackboard.
 
-**Current state:** Data structures and basic insert/mutate operations are implemented. Missing: dependency resolution, ready-gap polling, change notification, and serialization round-tripping.
+**Current state:** Fully implemented. All data structures, insert/mutate operations, dependency resolution, and ready-gap polling are in place and unit tested. Pending: change notification for HUD streaming.
 
-**Required additions:**
+**Implemented interface:**
 
 ```rust
 impl Blackboard {
     /// Return and atomically mark as Assigned all gaps currently in Ready state.
-    pub fn drain_ready(&self) -> Vec<Uuid> { ... }
+    pub(crate) fn drain_ready(&self) -> Vec<Gap>;
 
-    /// For every Blocked gap, check if all dependencies are Closed.
-    /// If so, promote to Ready. Returns the count of newly promoted gaps.
-    /// Uses the name_index to resolve dependency names to UUIDs in O(1).
-    pub fn promote_unblocked(&self) -> usize { ... }
+    /// For every Blocked gap whose dependencies are all Closed, promote to Ready.
+    pub(crate) fn promote_unblocked(&self);
 
     /// True when every gap is in Closed state.
-    pub fn all_closed(&self) -> bool { ... }
+    pub(crate) fn all_closed(&self) -> bool;
 
-    /// True when every gap is in Closed or Gated state (no Blocked/Ready/Assigned remain).
-    /// Used to detect the "all work paused for human approval" condition
-    /// without triggering a false Deadlock error.
-    pub fn all_gated_or_closed(&self) -> bool { ... }
+    /// True when every gap is in Closed or Gated state.
+    pub(crate) fn all_gated_or_closed(&self) -> bool;
 
-    /// Retrieve a gap by ID (clone for send across await).
-    pub fn get_gap(&self, id: &Uuid) -> Option<Gap> { ... }
+    /// Retrieve a gap by ID (cloned for send across await).
+    pub(crate) fn get_gap(&self, id: &Uuid) -> Option<Gap>;
 
     /// Retrieve a gap UUID by name slug. Used by promote_unblocked and dependency resolution.
     pub fn get_gap_id_by_name(&self, name: &str) -> Option<Uuid> { ... }
@@ -391,9 +344,9 @@ impl Blackboard {
 **Name→UUID reverse index:**
 `Gap.dependencies` stores names (`Vec<Box<str>>`), but the gap map is keyed by `Uuid`. A secondary index `name_index: DashMap<Box<str>, Uuid>` is populated atomically in `insert_gap` alongside the primary map. This makes `promote_unblocked` O(D) per gap (D = dependency count) instead of O(N·D) with a scan. The index is append-only — gap names are immutable after insertion.
 
-**Data structures — current vs. target:**
+**Data structures — as implemented:**
 
-The current `Gap` struct in `blackboard.rs` is minimal and uses a legacy `Pulse` enum (Network/Machine/Other) that is still referenced in the `Gap` constructor but has no role in the target architecture. The struct is missing `name`, `gap_type`, `dependencies`, `constraints`, and `expected_output` — all required for DAG execution. The `Evidence` struct replaces the ambiguous `done: bool` flag with a typed `EvidenceStatus`, and the `evidences` map changes from one-per-gap to an attempt log to support retry history. The target structs are:
+`blackboard.rs` implements the full target design. All fields are private with `pub(crate)` getters. The structs are:
 
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -430,9 +383,9 @@ pub enum EvidenceStatus {
 }
 ```
 
-The `Blackboard.evidences` field changes from `DashMap<Uuid, Evidence>` to `DashMap<Uuid, Vec<Evidence>>` — an ordered attempt log per gap. The Compiler for retry attempt N receives the `Vec<Evidence>` slice `[0..N-1]` so it can see prior errors and adapt.
+`Blackboard.evidences` is `DashMap<Uuid, Vec<Evidence>>` — an ordered attempt log per gap. The Compiler for retry attempt N receives the `Vec<Evidence>` slice `[0..N-1]` so it can see prior errors and adapt.
 
-The `Blackboard` struct gains a `name_index: DashMap<Box<str>, Uuid>` field for O(1) name-to-ID resolution. It is written once in `insert_gap` and never mutated after that.
+`Blackboard` includes `name_index: DashMap<Box<str>, Uuid>` for O(1) name-to-ID resolution. Written once in `insert_gap`, never mutated after that. `intent` is stored as `Mutex<Option<Box<str>>>` for safe mutation through a shared `&self` reference.
 
 **Thread-safety model:**
 `DashMap` provides per-shard read/write locks internally. Individual Gap state transitions (Ready -> Assigned) must be atomic. Use `DashMap::get_mut` which holds a write lock on the shard for the duration of the returned `RefMut`. The `drain_ready` method should iterate and CAS (compare-and-swap) in a single pass to avoid TOCTOU races where two threads both see the same gap as Ready.

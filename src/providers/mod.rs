@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use async_trait::async_trait;
+use crate::error::ProviderError;
 
 pub mod local;
 pub mod remote;
@@ -21,7 +21,12 @@ pub struct Message {
 
 #[async_trait]
 pub trait Provider: Send + Sync {
-    async fn complete_chat(&self, messages: Vec<Message>) -> String;
+    async fn complete_chat(&self, messages: Vec<Message>) -> Result<String, ProviderError>;
+
+    async fn complete_with_tools(&self, messages: Vec<Message>) -> Result<String, ProviderError> {
+        let _ = messages;
+        Err(ProviderError::NotSupported)
+    }
 }
 
 pub type DynProvider = Box<dyn Provider>;

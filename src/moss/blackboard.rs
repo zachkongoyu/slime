@@ -1,93 +1,317 @@
+use std::sync::Mutex;
+
 use dashmap::DashMap;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-#[derive(serde::Serialize)]
-pub(in crate::moss) enum GapState {
+use crate::error::MossError;
+
+// ── Gap ───────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) enum GapState {
     Blocked,
     Ready,
     Assigned,
+    Gated,
     Closed,
 }
 
-#[derive(serde::Serialize)]
-pub(in crate::moss) enum Pulse {
-    Network,
-    Machine,
-    Other(String),
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) enum GapType {
+    Proactive,
+    Reactive,
 }
 
-#[derive(serde::Serialize)]
-pub(in crate::moss) struct Gap {
-    gap_id: uuid::Uuid,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct Gap {
+    gap_id: Uuid,
+    name: Box<str>,
     state: GapState,
     description: Box<str>,
-    pulse: Pulse,
+    gap_type: GapType,
+    dependencies: Vec<Box<str>>,
+    constraints: Option<Value>,
+    expected_output: Option<Box<str>>,
 }
 
 impl Gap {
-    pub(in crate::moss) fn new(state: GapState, description: Box<str>, pulse: Pulse) -> Self {
+    pub(crate) fn new(
+        name: impl Into<Box<str>>,
+        description: impl Into<Box<str>>,
+        gap_type: GapType,
+        dependencies: Vec<Box<str>>,
+        constraints: Option<Value>,
+        expected_output: Option<Box<str>>,
+    ) -> Self {
+        let deps = dependencies;
+        let has_deps = !deps.is_empty();
         Self {
             gap_id: Uuid::new_v4(),
-            state,
-            description,
-            pulse,
+            name: name.into(),
+            state: if has_deps { GapState::Blocked } else { GapState::Ready },
+            description: description.into(),
+            gap_type,
+            dependencies: deps,
+            constraints,
+            expected_output,
         }
     }
 
-    pub(in crate::moss) fn set_state(&mut self, new_state: GapState) {
-        self.state = new_state;
-    }
+    pub(crate) fn gap_id(&self) -> Uuid { self.gap_id }
+    pub(crate) fn name(&self) -> &str { &self.name }
+    pub(crate) fn state(&self) -> &GapState { &self.state }
+    pub(crate) fn description(&self) -> &str { &self.description }
+    pub(crate) fn gap_type(&self) -> &GapType { &self.gap_type }
+    pub(crate) fn dependencies(&self) -> &[Box<str>] { &self.dependencies }
+    pub(crate) fn constraints(&self) -> Option<&Value> { self.constraints.as_ref() }
+    pub(crate) fn expected_output(&self) -> Option<&str> { self.expected_output.as_deref() }
 }
 
-#[derive(serde::Serialize)]
-pub(in crate::moss) struct Evidence {
-    gap_id: uuid::Uuid,
+// ── Evidence ──────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) enum EvidenceStatus {
+    Success,
+    Failure { reason: String },
+    Partial,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct Evidence {
+    gap_id: Uuid,
+    attempt: u32,
     content: Value,
-    done: bool,
+    status: EvidenceStatus,
 }
 
 impl Evidence {
-    pub(in crate::moss) fn new(gap_id: uuid::Uuid, content: Value) -> Self {
-        Self {
-            gap_id,
-            content,
-            done: false,
-        }
+    pub(crate) fn new(gap_id: Uuid, attempt: u32, content: Value, status: EvidenceStatus) -> Self {
+        Self { gap_id, attempt, content, status }
     }
+
+    pub(crate) fn gap_id(&self) -> Uuid { self.gap_id }
+    pub(crate) fn attempt(&self) -> u32 { self.attempt }
+    pub(crate) fn content(&self) -> &Value { &self.content }
+    pub(crate) fn status(&self) -> &EvidenceStatus { &self.status }
 }
 
-#[derive(serde::Serialize)]
-pub struct Blackboard {
-    intent: Option<Box<str>>,
-    /// evidences keyed by `gap_id` (single evidence per gap)
-    evidences: DashMap<uuid::Uuid, Evidence>,
-    gaps: DashMap<uuid::Uuid, Gap>,
-    gates: DashMap<Box<str>, Value>,
+// ── Blackboard ────────────────────────────────────────────────────────────────
+
+pub(crate) struct Blackboard {
+    intent: Mutex<Option<Box<str>>>,
+    gaps: DashMap<Uuid, Gap>,
+    name_index: DashMap<Box<str>, Uuid>,
+    evidences: DashMap<Uuid, Vec<Evidence>>,
+    gates: DashMap<Uuid, Value>,
 }
 
 impl Blackboard {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
-            intent: None,
-            evidences: DashMap::new(),
+            intent: Mutex::new(None),
             gaps: DashMap::new(),
+            name_index: DashMap::new(),
+            evidences: DashMap::new(),
             gates: DashMap::new(),
         }
     }
 
-    pub(in crate::moss) fn insert_gap(&self, gap: Gap) {
-        self.gaps.insert(gap.gap_id, gap);
+    pub(crate) fn set_intent(&self, intent: impl Into<Box<str>>) {
+        *self.intent.lock().unwrap() = Some(intent.into());
     }
 
-    pub(in crate::moss) fn set_gap_state(&self, gap_id: &uuid::Uuid, state: GapState) {
-        let mut g = self.gaps.get_mut(gap_id).expect("gap not found");
-        g.state = state;
+    pub(crate) fn get_intent(&self) -> Option<Box<str>> {
+        self.intent.lock().unwrap().clone()
     }
 
-    pub(in crate::moss) fn insert_evidence(&self, ev: Evidence) {
-        self.evidences.insert(ev.gap_id, ev);
+    pub(crate) fn insert_gap(&self, gap: Gap) -> Result<(), MossError> {
+        if self.name_index.contains_key(gap.name()) {
+            return Err(MossError::Blackboard(format!(
+                "gap '{}' already exists",
+                gap.name()
+            )));
+        }
+        let id = gap.gap_id();
+        let name = gap.name.clone();
+        self.gaps.insert(id, gap);
+        self.name_index.insert(name, id);
+        Ok(())
     }
 
+    pub(crate) fn set_gap_state(&self, gap_id: &Uuid, state: GapState) -> Result<(), MossError> {
+        self.gaps
+            .get_mut(gap_id)
+            .ok_or_else(|| MossError::Blackboard(format!("gap {gap_id} not found")))?
+            .state = state;
+        Ok(())
+    }
+
+    pub(crate) fn append_evidence(&self, ev: Evidence) {
+        self.evidences.entry(ev.gap_id()).or_default().push(ev);
+    }
+
+    pub(crate) fn get_gap(&self, gap_id: &Uuid) -> Option<Gap> {
+        self.gaps.get(gap_id).map(|g| g.clone())
+    }
+
+    pub(crate) fn get_gap_id_by_name(&self, name: &str) -> Option<Uuid> {
+        self.name_index.get(name).map(|id| *id)
+    }
+
+    pub(crate) fn get_evidence(&self, gap_id: &Uuid) -> Vec<Evidence> {
+        self.evidences.get(gap_id).map(|v| v.clone()).unwrap_or_default()
+    }
+
+    /// Promote every `Blocked` gap whose dependencies are all `Closed` → `Ready`.
+    pub(crate) fn promote_unblocked(&self) {
+        let to_promote: Vec<Uuid> = self
+            .gaps
+            .iter()
+            .filter(|entry| entry.state == GapState::Blocked)
+            .filter(|entry| {
+                entry.dependencies().iter().all(|dep_name| {
+                    self.name_index
+                        .get(dep_name.as_ref())
+                        .and_then(|id| self.gaps.get(&*id))
+                        .map(|dep| dep.state == GapState::Closed)
+                        .unwrap_or(false)
+                })
+            })
+            .map(|entry| entry.gap_id())
+            .collect();
+
+        for id in to_promote {
+            if let Some(mut g) = self.gaps.get_mut(&id) {
+                g.state = GapState::Ready;
+            }
+        }
+    }
+
+    /// Take all `Ready` gaps, mark them `Assigned`, and return them.
+    pub(crate) fn drain_ready(&self) -> Vec<Gap> {
+        let ready_ids: Vec<Uuid> = self
+            .gaps
+            .iter()
+            .filter(|entry| entry.state == GapState::Ready)
+            .map(|entry| entry.gap_id())
+            .collect();
+
+        let mut taken = Vec::new();
+        for id in ready_ids {
+            if let Some(mut g) = self.gaps.get_mut(&id) {
+                if g.state == GapState::Ready {
+                    g.state = GapState::Assigned;
+                    taken.push(g.clone());
+                }
+            }
+        }
+        taken
+    }
+
+    pub(crate) fn all_closed(&self) -> bool {
+        self.gaps.iter().all(|g| g.state == GapState::Closed)
+    }
+
+    pub(crate) fn all_gated_or_closed(&self) -> bool {
+        self.gaps.iter().all(|g| matches!(g.state, GapState::Gated | GapState::Closed))
+    }
+
+    pub(crate) fn insert_gate(&self, gap_id: Uuid, payload: Value) {
+        self.gates.insert(gap_id, payload);
+    }
 }
 
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn gap(name: &str, deps: Vec<&str>) -> Gap {
+        Gap::new(
+            name,
+            format!("description for {name}"),
+            GapType::Proactive,
+            deps.into_iter().map(|s| s.into()).collect(),
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn linear_chain_promote_unblocked() {
+        // A → B → C
+        let bb = Blackboard::new();
+        bb.insert_gap(gap("A", vec![])).unwrap();
+        bb.insert_gap(gap("B", vec!["A"])).unwrap();
+        bb.insert_gap(gap("C", vec!["B"])).unwrap();
+
+        let a_id = bb.get_gap_id_by_name("A").unwrap();
+        let b_id = bb.get_gap_id_by_name("B").unwrap();
+        let c_id = bb.get_gap_id_by_name("C").unwrap();
+
+        assert_eq!(bb.get_gap(&a_id).unwrap().state(), &GapState::Ready);
+        assert_eq!(bb.get_gap(&b_id).unwrap().state(), &GapState::Blocked);
+        assert_eq!(bb.get_gap(&c_id).unwrap().state(), &GapState::Blocked);
+
+        // Close A → B becomes Ready
+        bb.set_gap_state(&a_id, GapState::Closed).unwrap();
+        bb.promote_unblocked();
+        assert_eq!(bb.get_gap(&b_id).unwrap().state(), &GapState::Ready);
+        assert_eq!(bb.get_gap(&c_id).unwrap().state(), &GapState::Blocked);
+
+        // Close B → C becomes Ready
+        bb.set_gap_state(&b_id, GapState::Closed).unwrap();
+        bb.promote_unblocked();
+        assert_eq!(bb.get_gap(&c_id).unwrap().state(), &GapState::Ready);
+    }
+
+    #[test]
+    fn parallel_fanout_drain_ready() {
+        // X and Y are independent — both start Ready
+        let bb = Blackboard::new();
+        bb.insert_gap(gap("X", vec![])).unwrap();
+        bb.insert_gap(gap("Y", vec![])).unwrap();
+
+        let drained = bb.drain_ready();
+        assert_eq!(drained.len(), 2);
+
+        let x_id = bb.get_gap_id_by_name("X").unwrap();
+        let y_id = bb.get_gap_id_by_name("Y").unwrap();
+        assert_eq!(bb.get_gap(&x_id).unwrap().state(), &GapState::Assigned);
+        assert_eq!(bb.get_gap(&y_id).unwrap().state(), &GapState::Assigned);
+    }
+
+    #[test]
+    fn all_gated_or_closed() {
+        let bb = Blackboard::new();
+        bb.insert_gap(gap("P", vec![])).unwrap();
+        bb.insert_gap(gap("Q", vec![])).unwrap();
+
+        assert!(!bb.all_gated_or_closed());
+
+        let p_id = bb.get_gap_id_by_name("P").unwrap();
+        let q_id = bb.get_gap_id_by_name("Q").unwrap();
+        bb.set_gap_state(&p_id, GapState::Gated).unwrap();
+        bb.set_gap_state(&q_id, GapState::Closed).unwrap();
+
+        assert!(bb.all_gated_or_closed());
+    }
+
+    #[test]
+    fn append_and_get_evidence() {
+        let bb = Blackboard::new();
+        let gap_id = Uuid::new_v4();
+
+        bb.append_evidence(Evidence::new(gap_id, 1, json!({"result": 42}), EvidenceStatus::Success));
+        bb.append_evidence(Evidence::new(gap_id, 2, json!({"result": 99}), EvidenceStatus::Partial));
+
+        let evs = bb.get_evidence(&gap_id);
+        assert_eq!(evs.len(), 2);
+        assert_eq!(evs[0].attempt(), 1);
+        assert_eq!(evs[1].attempt(), 2);
+    }
+}

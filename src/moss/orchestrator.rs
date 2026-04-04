@@ -1,46 +1,87 @@
-use crate::{moss::blackboard, providers::{DynProvider, Message, Role}};
-use serde_json::Value;
+use std::sync::Arc;
 
-use super::blackboard::{Blackboard, Evidence, GapState};
+use minijinja::{Environment, context};
 
-pub struct Orchestrator {
-    provider: DynProvider
+use crate::error::MossError;
+use crate::providers::{Message, Role, Provider};
+
+use super::blackboard::Blackboard;
+use super::decomposition::Decomposition;
+
+pub(crate) struct Orchestrator {
+    provider: Arc<dyn Provider>,
 }
 
 impl Orchestrator {
-    pub fn new(provider: DynProvider) -> Self {
+    pub(crate) fn new(provider: Arc<dyn Provider>) -> Self {
         Self { provider }
     }
 
-    pub async fn synthesize(&self, query: &str, blackboard: &Blackboard) -> Value {
-        let template = std::fs::read_to_string("src/moss/prompts/orchestrator.xml")
-            .expect("orchestrator prompt file missing: src/moss/prompts/orchestrator.xml");
+    /// Ask the LLM to decompose the query into a Gap DAG and insert gaps into the Blackboard.
+    /// Returns the intent string and the names of the gaps created.
+    pub(crate) async fn decompose(&self, query: &str, blackboard: &Blackboard) -> Result<Decomposition, MossError> {
+        let template_src = include_str!("prompts/decompose.md");
 
-        let blackboard_state = serde_json::to_string(blackboard).unwrap();
+        let blackboard_state = blackboard
+            .get_intent()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "{}".to_string());
 
-        let rendered = template
-            .replace("{user_query}", query)
-            .replace("{blackboard_state}", &blackboard_state);
+        let mut env = Environment::new();
+        env.add_template("decompose", template_src)
+            .map_err(|e| MossError::Blackboard(format!("template error: {e}")))?;
+
+        let tmpl = env.get_template("decompose")
+            .map_err(|e| MossError::Blackboard(format!("template load error: {e}")))?;
+
+        let rendered = tmpl
+            .render(context! { user_query => query, blackboard_state => blackboard_state })
+            .map_err(|e| MossError::Blackboard(format!("template render error: {e}")))?;
 
         let messages = vec![Message { role: Role::User, content: rendered.into_boxed_str() }];
 
-        let response = self.provider.complete_chat(messages).await;
+        let raw = self.provider.complete_chat(messages).await?;
 
-        let clean = response
+        // Strip markdown fences if the model wrapped the JSON anyway
+        let json_str = raw
             .trim()
-            .strip_prefix("```json")
-            .unwrap_or(&response)
-            .strip_prefix("```")
-            .unwrap_or(&response)
-            .strip_suffix("```")
-            .unwrap_or(&response)
+            .trim_start_matches("```json")
+            .trim_start_matches("```")
+            .trim_end_matches("```")
             .trim();
 
-        let value = serde_json::from_str(clean).unwrap();
+        let decomposition: Decomposition = serde_json::from_str(json_str)?;
 
-        std::fs::write("output.json", serde_json::to_string_pretty(&value).unwrap())
-            .expect("write failed");
+        Ok(decomposition)
+    }
 
-        value
+    /// Collect evidence from the Blackboard and synthesize a final answer.
+    pub(crate) async fn synthesize(&self, blackboard: &Blackboard) -> Result<String, MossError> {
+        let template_src = include_str!("prompts/synthesize.md");
+
+        let intent = blackboard
+            .get_intent()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "unknown intent".to_string());
+
+        // Placeholder — Phase 5 will pass real Evidence here
+        let evidence = "No evidence collected yet.".to_string();
+
+        let mut env = Environment::new();
+        env.add_template("synthesize", template_src)
+            .map_err(|e| MossError::Blackboard(format!("template error: {e}")))?;
+
+        let tmpl = env.get_template("synthesize")
+            .map_err(|e| MossError::Blackboard(format!("template load error: {e}")))?;
+
+        let rendered = tmpl
+            .render(context! { intent => intent, evidence => evidence })
+            .map_err(|e| MossError::Blackboard(format!("template render error: {e}")))?;
+
+        let messages = vec![Message { role: Role::User, content: rendered.into_boxed_str() }];
+
+        let response = self.provider.complete_chat(messages).await?;
+
+        Ok(response)
     }
 }
