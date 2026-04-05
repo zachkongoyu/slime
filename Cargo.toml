@@ -14,3 +14,4 @@ async-trait = "0.1"
 uuid = { version = "1.0", features = ["serde", "v4"] }
 thiserror = "1"
 minijinja = "2"
+tempfile = "3"

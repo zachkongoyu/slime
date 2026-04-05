@@ -221,6 +221,13 @@ impl Blackboard {
     pub(crate) fn insert_gate(&self, gap_id: Uuid, payload: Value) {
         self.gates.insert(gap_id, payload);
     }
+
+    pub(crate) fn all_evidence(&self) -> Vec<Evidence> {
+        self.evidences
+            .iter()
+            .flat_map(|entry| entry.value().clone())
+            .collect()
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

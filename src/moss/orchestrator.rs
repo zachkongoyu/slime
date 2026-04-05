@@ -64,8 +64,7 @@ impl Orchestrator {
             .map(|s| s.to_string())
             .unwrap_or_else(|| "unknown intent".to_string());
 
-        // Placeholder — Phase 5 will pass real Evidence here
-        let evidence = "No evidence collected yet.".to_string();
+        let evidence = serde_json::to_string_pretty(&blackboard.all_evidence())?;
 
         let mut env = Environment::new();
         env.add_template("synthesize", template_src)
