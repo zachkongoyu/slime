@@ -1,4 +1,5 @@
 use std::sync::Mutex;
+use std::collections::HashMap;
 
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
@@ -99,12 +100,21 @@ impl Evidence {
 
 // ── Blackboard ────────────────────────────────────────────────────────────────
 
+#[derive(Debug)]
 pub(crate) struct Blackboard {
     intent: Mutex<Option<Box<str>>>,
     gaps: DashMap<Uuid, Gap>,
     name_index: DashMap<Box<str>, Uuid>,
     evidences: DashMap<Uuid, Vec<Evidence>>,
     gates: DashMap<Uuid, Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct BlackboardSnapshot {
+    intent: Option<Box<str>>,
+    gaps: HashMap<Uuid, Gap>,
+    evidences: HashMap<Uuid, Vec<Evidence>>,
+    gates: HashMap<Uuid, Value>,
 }
 
 impl Blackboard {
@@ -227,6 +237,15 @@ impl Blackboard {
             .iter()
             .flat_map(|entry| entry.value().clone())
             .collect()
+    }
+
+    pub(crate) fn snapshot(&self) -> BlackboardSnapshot {
+        BlackboardSnapshot {
+            intent: self.intent.lock().unwrap().clone(),
+            gaps: self.gaps.iter().map(|e| (*e.key(), e.value().clone())).collect(),
+            evidences: self.evidences.iter().map(|e| (*e.key(), e.value().clone())).collect(),
+            gates: self.gates.iter().map(|e| (*e.key(), e.value().clone())).collect(),
+        }
     }
 }
 

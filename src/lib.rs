@@ -2,7 +2,7 @@ pub mod error;
 pub mod moss;
 pub mod providers;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use error::MossError;
 use moss::blackboard::{Blackboard, Gap};
@@ -15,49 +15,67 @@ use providers::Provider;
 pub struct Moss {
     orchestrator: Orchestrator,
     runner: Runner,
-    blackboard: Arc<Blackboard>,
+    /// Swappable: replaced when the Orchestrator signals a new topic.
+    blackboard: Mutex<Arc<Blackboard>>,
 }
 
 impl Moss {
     pub fn new(provider: Arc<dyn Provider>) -> Self {
-        let blackboard = Arc::new(Blackboard::new());
         Self {
             orchestrator: Orchestrator::new(Arc::clone(&provider)),
             runner: Runner::new(Arc::clone(&provider)),
-            blackboard,
+            blackboard: Mutex::new(Arc::new(Blackboard::new())),
         }
     }
 
     /// Run a single user query end-to-end:
-    /// 1. Decompose into a Gap DAG
-    /// 2. Execute all gaps (compile → run → retry) until closed
-    /// 3. Synthesize a final answer from the collected Evidence
+    /// 1. Snapshot the current Blackboard state for the Orchestrator
+    /// 2. Decompose — LLM sees full board state, signals follow-up or new topic
+    /// 3. Swap to a fresh Blackboard if new topic
+    /// 4. Refine intent on the active board
+    /// 5. Insert new Gaps
+    /// 6. Execute all Gaps (compile → run → retry) until closed
+    /// 7. Synthesize a final answer from the collected Evidence
     pub async fn run(&self, query: &str) -> Result<String, MossError> {
-        // 1. Decompose
-        let decomposition = self.orchestrator.decompose(query, &self.blackboard).await?;
+        // [1] Snapshot the current board for the Orchestrator
+        let board = self.blackboard.lock().unwrap().clone();
 
+        // [2] Decompose — LLM sees the full board state and signals follow-up or new topic
+        let decomposition = self.orchestrator.decompose(query, &board).await?;
+
+        // [3] Swap board if this is a new topic
+        let board = if decomposition.is_follow_up {
+            board
+        } else {
+            // TODO: Sealing the old blackboard
+
+            let fresh = Arc::new(Blackboard::new());
+            *self.blackboard.lock().unwrap() = Arc::clone(&fresh);
+            fresh
+        };
+
+        // [4] Refine intent on the active board
         if let Some(ref intent) = decomposition.intent {
-            self.blackboard.set_intent(intent.as_str());
+            board.set_intent(intent.as_str());
         }
 
-        if let Some(specs) = decomposition.gaps {
-            for spec in specs {
-                let gap = Gap::new(
-                    spec.name,
-                    spec.description,
-                    spec.gap_type,
-                    spec.dependencies.into_iter().map(|s| s.into_boxed_str()).collect(),
-                    spec.constraints,
-                    spec.expected_output.map(|s| s.into_boxed_str()),
-                );
-                self.blackboard.insert_gap(gap)?;
-            }
+        // [5] Insert new Gaps
+        for spec in decomposition.gaps.unwrap_or_default() {
+            let gap = Gap::new(
+                spec.name,
+                spec.description,
+                spec.gap_type,
+                spec.dependencies.into_iter().map(|s| s.into_boxed_str()).collect(),
+                spec.constraints,
+                spec.expected_output.map(|s| s.into_boxed_str()),
+            );
+            board.insert_gap(gap)?;
         }
 
-        // 2. Execute
-        self.runner.run(Arc::clone(&self.blackboard)).await?;
+        // [6] Execute
+        self.runner.run(Arc::clone(&board)).await?;
 
-        // 3. Synthesize
-        self.orchestrator.synthesize(&self.blackboard).await
+        // [7] Synthesize
+        self.orchestrator.synthesize(&board).await
     }
 }

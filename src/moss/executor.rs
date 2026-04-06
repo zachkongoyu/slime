@@ -2,9 +2,9 @@ use std::io::Write;
 use std::time::Duration;
 
 use serde_json::Value;
-use tempfile::NamedTempFile;
 use tokio::process::Command;
 use tokio::time::timeout;
+use tracing::debug;
 
 use crate::error::MossError;
 
@@ -64,9 +64,20 @@ impl Executor {
             other                        => other,   // pass through — LLM knows best
         };
 
-        // Write code to a temp file. The file is auto-deleted when `tmp` is dropped.
-        let mut tmp = NamedTempFile::new()?;
+        // Write code to a temp file with the correct extension so the interpreter
+        // recognises the file type. Auto-deleted when `tmp` is dropped.
+        let ext = match interpreter {
+            "python3"           => ".py",
+            "sh"                => ".sh",
+            "node"              => ".js",
+            _                   => ".tmp",
+        };
+        let mut tmp = tempfile::Builder::new()
+            .prefix("moss-gap-")
+            .suffix(ext)
+            .tempfile()?;
         tmp.write_all(code.as_bytes())?;
+        debug!(path = ?tmp.path(), "temp script written");
 
         // Spawn and wait, bounded by timeout.
         let run = Command::new(interpreter).arg(tmp.path()).output();
@@ -100,6 +111,7 @@ impl Executor {
         };
 
         let ev = Evidence::new(gap.gap_id(), self.next_attempt(gap, blackboard), content, status);
+        debug!(evidence = ?ev, "evidence written");
         blackboard.append_evidence(ev);
 
         Ok(())

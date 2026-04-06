@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use minijinja::{Environment, context};
+use tracing::info;
 
 use crate::error::MossError;
 use crate::providers::{Message, Role, Provider};
@@ -22,10 +23,7 @@ impl Orchestrator {
     pub(crate) async fn decompose(&self, query: &str, blackboard: &Blackboard) -> Result<Decomposition, MossError> {
         let template_src = include_str!("prompts/decompose.md");
 
-        let blackboard_state = blackboard
-            .get_intent()
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| "{}".to_string());
+        let blackboard_state = blackboard.snapshot();
 
         let mut env = Environment::new();
         env.add_template("decompose", template_src)
@@ -51,6 +49,13 @@ impl Orchestrator {
             .trim();
 
         let decomposition: Decomposition = serde_json::from_str(json_str)?;
+
+        let gap_names: Vec<&str> = decomposition.gaps.as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .map(|g| g.name.as_str())
+            .collect();
+        info!(intent = ?decomposition.intent, gaps = ?gap_names, "decomposed");
 
         Ok(decomposition)
     }
@@ -79,6 +84,7 @@ impl Orchestrator {
 
         let messages = vec![Message { role: Role::User, content: rendered.into_boxed_str() }];
 
+        info!("synthesizing final answer");
         let response = self.provider.complete_chat(messages).await?;
 
         Ok(response)

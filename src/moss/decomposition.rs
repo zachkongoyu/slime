@@ -8,6 +8,7 @@ use super::blackboard::GapType;
 pub(crate) struct Decomposition {
     pub(crate) intent: Option<String>,
     pub(crate) gaps: Option<Vec<GapSpec>>,
+    pub(crate) is_follow_up: bool,
 }
 
 /// One gap as described by the LLM — consumed once to build a `Gap` and insert it into the Blackboard.

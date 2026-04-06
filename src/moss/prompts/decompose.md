@@ -14,13 +14,15 @@ Every Gap is resolved by executing code, not by reasoning. Your job is decomposi
 - No meta-tasks: no "understand the query" or "make a plan" Gaps.
 - If the query is fully answered by the Blackboard, return `"gaps": []`.
 - If the query is nonsensical or uninterpretable, return `"intent": null, "gaps": null`.
+- Set `is_follow_up: true` if the query extends or refines the current Blackboard (same topic, references existing Gaps, or builds on prior intent). Set `is_follow_up: false` if the query is a new, unrelated topic. If the Blackboard is empty, always set `is_follow_up: false`.
 
 ## Output Format
 Return ONLY valid JSON. No markdown fences. No explanation. No trailing text.
 
 ```json
 {
-  "intent": "string — the ultimate goal of the user",
+  "intent": "string — the current/updated goal of the Blackboard",
+  "is_follow_up": true,
   "gaps": [
     {
       "name": "snake_case identifier",
@@ -43,6 +45,7 @@ Correct output:
 ```json
 {
   "intent": "Find the fastest train route from London to Edinburgh and its cost",
+  "is_follow_up": false,
   "gaps": [
     {
       "name": "fetch_train_routes",
@@ -68,5 +71,5 @@ Correct output:
 
 ```xml
 <user_query>{{ user_query }}</user_query>
-<blackboard_state>{{ blackboard_state }}</blackboard_state>
+<blackboard_state>{{ blackboard_state | tojson(indent=2) }}</blackboard_state>
 ```

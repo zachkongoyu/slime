@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use tokio::task::JoinSet;
+use tracing::{debug, info, trace, warn};
 
 use crate::error::MossError;
 use crate::providers::Provider;
@@ -30,6 +31,7 @@ impl Runner {
     pub(crate) async fn run(&self, blackboard: Arc<Blackboard>) -> Result<(), MossError> {
         loop {
             blackboard.promote_unblocked();
+            debug!(blackboard = ?blackboard, "round start");
             let ready = blackboard.drain_ready();
 
             if ready.is_empty() {
@@ -61,12 +63,17 @@ impl Runner {
                         .collect();
 
                     if attempt_count >= MAX_RETRIES {
-                        // Give up — close so dependents are not blocked forever.
+                        warn!(gap = %gap.name(), "max retries reached — force closing");
                         return bb.set_gap_state(&gap.gap_id(), GapState::Closed);
                     }
 
+                    trace!(gap = ?gap, "gap detail before compile");
+                    info!(gap = %gap.name(), attempt = attempt_count + 1, "compiling");
                     let artifact = compiler.compile(&gap, &prior).await?;
+
+                    info!(gap = %gap.name(), attempt = attempt_count + 1, "executing");
                     Executor::new().run(&gap, &artifact, &bb).await?;
+                    trace!(blackboard = ?bb, "blackboard after execution");
 
                     // Decide whether to close or queue for retry next round.
                     let last_success = bb
@@ -76,8 +83,10 @@ impl Runner {
                         .unwrap_or(false);
 
                     if last_success {
+                        info!(gap = %gap.name(), "closed (success)");
                         bb.set_gap_state(&gap.gap_id(), GapState::Closed)
                     } else {
+                        warn!(gap = %gap.name(), "execution failed — will retry");
                         bb.set_gap_state(&gap.gap_id(), GapState::Ready)
                     }
                 });
