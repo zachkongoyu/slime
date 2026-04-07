@@ -5,26 +5,24 @@ use moss::providers::remote::openrouter::OpenRouter;
 
 #[tokio::main]
 async fn main() {
+    // Configure tracing to output structured JSON for better observability
     tracing_subscriber::fmt()
         .pretty()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("moss=info")),
         )
-        .without_time()
         .init();
 
-    println!("  Log level: set RUST_LOG=moss=info|debug|trace");
-
-    println!("Moss CLI — simple interactive shell");
+    tracing::info!("Moss CLI started. Set RUST_LOG=moss=info|debug|trace to change log level.");
 
     let provider = match OpenRouter::new(None, None) {
         Ok(p) => {
-            println!("Using OpenRouter provider");
+            tracing::info!("Using OpenRouter provider");
             Arc::new(p)
         }
         Err(e) => {
-            eprintln!("Provider not configured: {}. Exiting.", e);
+            tracing::error!(error = %e, "Provider not configured. Exiting.");
             std::process::exit(1);
         }
     };
@@ -35,7 +33,7 @@ async fn main() {
     let stdin = io::stdin();
     let mut lines = BufReader::new(stdin).lines();
 
-    println!("Chat loop: type a message and press Enter. Type 'exit' to quit.");
+    tracing::info!("Chat loop: type a message and press Enter. Type 'exit' to quit.");
 
     loop {
         match lines.next_line().await {
@@ -50,16 +48,16 @@ async fn main() {
 
                 match moss.run(&input).await {
                     Ok(msg) => println!("{msg}"),
-                    Err(e) => eprintln!("error: {e}"),
+                    Err(e) => tracing::error!(error = %e, "Failed to run moss"),
                 }
             }
             Ok(None) => break,
             Err(e) => {
-                eprintln!("stdin error: {e}");
+                tracing::error!(error = %e, "stdin error");
                 break;
             }
         }
     }
 
-    println!("bye");
+    tracing::info!("bye");
 }

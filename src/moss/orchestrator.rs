@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use minijinja::{Environment, context};
 use tracing::info;
@@ -6,16 +6,60 @@ use tracing::info;
 use crate::error::MossError;
 use crate::providers::{Message, Role, Provider};
 
-use super::blackboard::Blackboard;
+use super::blackboard::{Blackboard, Gap};
 use super::decomposition::Decomposition;
+use super::runner::Runner;
 
 pub(crate) struct Orchestrator {
     provider: Arc<dyn Provider>,
+    runner: Runner,
+    blackboard: Mutex<Arc<Blackboard>>,
 }
 
 impl Orchestrator {
     pub(crate) fn new(provider: Arc<dyn Provider>) -> Self {
-        Self { provider }
+        Self {
+            provider: Arc::clone(&provider),
+            runner: Runner::new(Arc::clone(&provider)),
+            blackboard: Mutex::new(Arc::new(Blackboard::new())),
+        }
+    }
+
+    /// Run a single user query end-to-end.
+    pub(crate) async fn run(&self, query: &str) -> Result<String, MossError> {
+        let board = self.blackboard.lock().unwrap().clone();
+
+        let decomposition = self.decompose(query, &board).await?;
+
+        let board = if decomposition.is_follow_up {
+            board
+        } else {
+            // TODO: Sealing the old blackboard
+
+            let fresh = Arc::new(Blackboard::new());
+            *self.blackboard.lock().unwrap() = Arc::clone(&fresh);
+            fresh
+        };
+
+        if let Some(ref intent) = decomposition.intent {
+            board.set_intent(intent.as_str());
+        }
+
+        for spec in decomposition.gaps.unwrap_or_default() {
+            let gap = Gap::new(
+                spec.name,
+                spec.description,
+                spec.gap_type,
+                spec.dependencies.into_iter().map(|s| s.into_boxed_str()).collect(),
+                spec.constraints,
+                spec.expected_output.map(|s| s.into_boxed_str()),
+            );
+            board.insert_gap(gap)?;
+        }
+
+        self.runner.run(Arc::clone(&board)).await?;
+
+        self.synthesize(&board).await
     }
 
     /// Ask the LLM to decompose the query into a Gap DAG and insert gaps into the Blackboard.
@@ -50,12 +94,9 @@ impl Orchestrator {
 
         let decomposition: Decomposition = serde_json::from_str(json_str)?;
 
-        let gap_names: Vec<&str> = decomposition.gaps.as_deref()
-            .unwrap_or(&[])
-            .iter()
-            .map(|g| g.name.as_str())
-            .collect();
-        info!(intent = ?decomposition.intent, gaps = ?gap_names, "decomposed");
+        if let Ok(pretty) = serde_json::to_string_pretty(&decomposition) {
+            info!("Decomposed DAG:\n{}", pretty);
+        }
 
         Ok(decomposition)
     }

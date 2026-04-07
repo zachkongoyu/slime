@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use tokio::task::JoinSet;
-use tracing::{debug, info, trace, warn};
+use tracing::{info, warn};
 
 use crate::error::MossError;
 use crate::providers::Provider;
@@ -26,12 +26,9 @@ impl Runner {
         }
     }
 
-    /// Drive the Gap DAG to completion.
-    /// Each round: promote blocked gaps → drain ready → compile+execute in parallel → repeat.
     pub(crate) async fn run(&self, blackboard: Arc<Blackboard>) -> Result<(), MossError> {
         loop {
             blackboard.promote_unblocked();
-            debug!(blackboard = ?blackboard, "round start");
             let ready = blackboard.drain_ready();
 
             if ready.is_empty() {
@@ -42,7 +39,9 @@ impl Runner {
                 };
             }
 
-            // Spawn one task per ready Gap — they run concurrently.
+            let dispatched: Vec<&str> = ready.iter().map(|g| g.name()).collect();
+            info!(gaps = ?dispatched, "round dispatched");
+
             let mut tasks: JoinSet<Result<(), MossError>> = JoinSet::new();
 
             for gap in ready {
@@ -53,7 +52,6 @@ impl Runner {
                     let evs = bb.get_evidence(&gap.gap_id());
                     let attempt_count = evs.len() as u32;
 
-                    // Collect previous failure reasons to pass to the Compiler prompt.
                     let prior: Vec<Box<str>> = evs
                         .iter()
                         .filter_map(|ev| match ev.status() {
@@ -67,15 +65,9 @@ impl Runner {
                         return bb.set_gap_state(&gap.gap_id(), GapState::Closed);
                     }
 
-                    trace!(gap = ?gap, "gap detail before compile");
-                    info!(gap = %gap.name(), attempt = attempt_count + 1, "compiling");
                     let artifact = compiler.compile(&gap, &prior).await?;
-
-                    info!(gap = %gap.name(), attempt = attempt_count + 1, "executing");
                     Executor::new().run(&gap, &artifact, &bb).await?;
-                    trace!(blackboard = ?bb, "blackboard after execution");
 
-                    // Decide whether to close or queue for retry next round.
                     let last_success = bb
                         .get_evidence(&gap.gap_id())
                         .last()
@@ -92,7 +84,6 @@ impl Runner {
                 });
             }
 
-            // Wait for every task in this round; surface the first error.
             while let Some(result) = tasks.join_next().await {
                 result.map_err(|e| MossError::Blackboard(format!("task panicked: {e}")))??;
             }
