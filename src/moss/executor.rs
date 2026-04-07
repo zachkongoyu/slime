@@ -127,7 +127,10 @@ impl Executor {
 #[cfg(test)]
 mod tests {
     use crate::moss::blackboard::{Blackboard, EvidenceStatus, Gap, GapType};
+    use crate::moss::signal;
     use super::{Artifact, Executor};
+
+    fn bb() -> Blackboard { Blackboard::new(signal::channel(1).0) }
 
     fn make_gap(name: &str) -> Gap {
         Gap::new(name, "desc", GapType::Proactive, vec![], None, None)
@@ -143,7 +146,7 @@ mod tests {
 
     #[tokio::test]
     async fn script_success_writes_evidence() {
-        let bb = Blackboard::new();
+        let bb = bb();
         let gap = make_gap("echo_gap");
         bb.insert_gap(gap.clone()).unwrap();
 
@@ -160,7 +163,7 @@ mod tests {
 
     #[tokio::test]
     async fn script_non_json_stdout_is_partial() {
-        let bb = Blackboard::new();
+        let bb = bb();
         let gap = make_gap("plain_gap");
         bb.insert_gap(gap.clone()).unwrap();
 
@@ -175,7 +178,7 @@ mod tests {
 
     #[tokio::test]
     async fn script_nonzero_exit_is_failure() {
-        let bb = Blackboard::new();
+        let bb = bb();
         let gap = make_gap("fail_gap");
         bb.insert_gap(gap.clone()).unwrap();
 
@@ -190,7 +193,7 @@ mod tests {
 
     #[tokio::test]
     async fn attempt_increments_on_retry() {
-        let bb = Blackboard::new();
+        let bb = bb();
         let gap = make_gap("retry_gap");
         bb.insert_gap(gap.clone()).unwrap();
 

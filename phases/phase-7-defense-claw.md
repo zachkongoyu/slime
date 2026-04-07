@@ -1,7 +1,6 @@
-# Phase 7 — DefenseClaw
+# Phase 7 — Gate
 
-**Status:** Blocked on Phase 6
-**ADRs:** [ADR-007](../docs/ADR-007-defenseclaw-and-hitl-gating.md)
+**Status:** Next
 **Effort:** ~100 lines. One focused session.
 
 ---
@@ -11,19 +10,19 @@
 Security scanner inserted between compile and execute in the Runner's per-gap task.
 
 ```rust
-pub(crate) struct DefenseClaw {
-    blocklist: Vec<String>,
+pub(crate) struct Gate {
+    blocklist: Vec<Box<str>>,
     max_script_size: usize,
 }
 
 pub(crate) enum ScanVerdict {
     Approved,
-    Gated { reason: String },
-    Rejected { reason: String },
+    Gated { reason: Box<str> },
+    Rejected { reason: Box<str> },
 }
 
-impl DefenseClaw {
-    pub(crate) fn scan(&self, artifact: &Artifact, constraints: &Option<Value>) -> ScanVerdict;
+impl Gate {
+    pub(crate) fn scan(&self, artifact: &Artifact, constraints: Option<&Value>) -> ScanVerdict;
 }
 ```
 
@@ -33,28 +32,33 @@ impl DefenseClaw {
 |-------|-------|---------|
 | 1. Static analysis | Forbidden imports, network calls in Proactive scripts, writes outside sandbox | Rejected |
 | 2. Capability check | Artifact tools vs. Gap constraints | Rejected |
-| 3. Resource bounds | Timeout and memory limits set | Rejected |
+| 3. Resource bounds | Script size within `max_script_size` | Rejected |
 | 4. HITL gate | High-risk action patterns (email, delete, purchase) against blocklist | Gated |
+
+`Gate` is stateless policy — no I/O, no async. Pure function of artifact + constraints.
 
 **Wiring into Runner (per-gap task):**
 
 ```rust
 let artifact = compiler.compile(&gap, &prior).await?;
 
-match defense_claw.scan(&artifact, gap.constraints()) {
-    ScanVerdict::Approved => { /* fall through to execute */ }
+match gate.scan(&artifact, gap.constraints()) {
+    ScanVerdict::Approved => {}
     ScanVerdict::Gated { reason } => {
         bb.set_gap_state(&gap.gap_id(), GapState::Gated)?;
-        let rx = bb.insert_gate(gap.gap_id(), reason);  // emits Signal::GateRequested
-        let approved = rx.await.unwrap_or(false);         // await human I/O
+        // emit GateRequested through signal channel — Cli prompts user
+        // this is the moment signal::Payload evolves from Box<str> to Event enum
+        let approved = /* await human decision via oneshot */ false;
         if !approved {
-            // post rejection evidence, close gap
+            bb.append_evidence(Evidence::rejection(&gap, reason));
+            bb.set_gap_state(&gap.gap_id(), GapState::Closed)?;
             return Ok(());
         }
         bb.set_gap_state(&gap.gap_id(), GapState::Assigned)?;
     }
     ScanVerdict::Rejected { reason } => {
-        // post failure evidence, close gap
+        bb.append_evidence(Evidence::rejection(&gap, reason));
+        bb.set_gap_state(&gap.gap_id(), GapState::Closed)?;
         return Ok(());
     }
 }
@@ -62,6 +66,8 @@ match defense_claw.scan(&artifact, gap.constraints()) {
 Executor::new().run(&gap, &artifact, &bb).await?;
 ```
 
-**Files:** `src/moss/defense_claw.rs` (new), `src/moss/runner.rs`, `src/moss/mod.rs`
+**Signal evolution:** `Gated` is the first semantic event that `Cli` must render to the user. This phase is the natural point to evolve `signal::Payload` from `type Payload = Box<str>` to a typed `Event` enum (`Snapshot`, `GateRequested { gap_id, reason }`). `Cli` then pattern-matches on `Event` instead of parsing raw strings.
 
-**Tests:** Unit test each scan stage independently. Integration test: mock provider producing one gatable + one clean artifact, verify gate fires while clean runs.
+**Files:** `src/moss/gate.rs` (new), `src/moss/runner.rs`, `src/moss/mod.rs`
+
+**Tests:** Unit test each scan stage independently. Integration test: mock provider producing one gatable + one clean artifact, verify gate fires while clean gap runs concurrently.

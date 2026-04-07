@@ -27,26 +27,17 @@ impl Runner {
     }
 
     pub(crate) async fn run(&self, blackboard: Arc<Blackboard>) -> Result<(), MossError> {
+        let mut tasks: JoinSet<Result<(), MossError>> = JoinSet::new();
+
         loop {
             blackboard.promote_unblocked();
-            let ready = blackboard.drain_ready();
 
-            if ready.is_empty() {
-                return if blackboard.all_gated_or_closed() {
-                    Ok(())
-                } else {
-                    Err(MossError::Deadlock)
-                };
-            }
-
-            let dispatched: Vec<&str> = ready.iter().map(|g| g.name()).collect();
-            info!(gaps = ?dispatched, "round dispatched");
-
-            let mut tasks: JoinSet<Result<(), MossError>> = JoinSet::new();
-
-            for gap in ready {
+            for gap in blackboard.drain_ready() {
                 let compiler = Arc::clone(&self.compiler);
-                let bb = Arc::clone(&blackboard);
+                let bb: Arc<Blackboard> = Arc::clone(&blackboard);
+
+                let dispatched = gap.name().to_string();
+                info!(gap = %dispatched, "dispatched");
 
                 tasks.spawn(async move {
                     let evs = bb.get_evidence(&gap.gap_id());
@@ -84,7 +75,15 @@ impl Runner {
                 });
             }
 
-            while let Some(result) = tasks.join_next().await {
+            if tasks.is_empty() {
+                return if blackboard.all_closed() {
+                    Ok(())
+                } else {
+                    Err(MossError::Deadlock)
+                };
+            }
+
+            if let Some(result) = tasks.join_next().await {
                 result.map_err(|e| MossError::Blackboard(format!("task panicked: {e}")))??;
             }
         }
@@ -101,7 +100,10 @@ mod tests {
 
     use crate::error::ProviderError;
     use crate::moss::blackboard::{Blackboard, Gap, GapState, GapType};
+    use crate::moss::signal;
     use crate::providers::{Message, Provider};
+
+    fn bb() -> Arc<Blackboard> { Arc::new(Blackboard::new(signal::channel(1).0)) }
 
     use super::Runner;
 
@@ -150,7 +152,7 @@ mod tests {
 
     #[tokio::test]
     async fn single_gap_closes_on_success() {
-        let bb = Arc::new(Blackboard::new());
+        let bb = bb();
         bb.insert_gap(gap("g1", vec![])).unwrap();
 
         Runner::new(Arc::new(AlwaysSucceedProvider))
@@ -164,7 +166,7 @@ mod tests {
 
     #[tokio::test]
     async fn linear_chain_closes_in_order() {
-        let bb = Arc::new(Blackboard::new());
+        let bb = bb();
         bb.insert_gap(gap("A", vec![])).unwrap();
         bb.insert_gap(gap("B", vec!["A"])).unwrap();
 
@@ -181,7 +183,7 @@ mod tests {
 
     #[tokio::test]
     async fn gap_retries_after_failure() {
-        let bb = Arc::new(Blackboard::new());
+        let bb = bb();
         bb.insert_gap(gap("retry_gap", vec![])).unwrap();
 
         Runner::new(Arc::new(FailOnceThenSucceedProvider::new()))
@@ -198,7 +200,7 @@ mod tests {
     #[tokio::test]
     async fn deadlock_if_deps_never_close() {
         // B depends on A, but A is never inserted — B stays Blocked forever.
-        let bb = Arc::new(Blackboard::new());
+        let bb = bb();
         bb.insert_gap(gap("B", vec!["A"])).unwrap();
 
         let result = Runner::new(Arc::new(AlwaysSucceedProvider))

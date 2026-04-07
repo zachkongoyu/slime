@@ -7,6 +7,9 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::error::MossError;
+use tokio::sync::broadcast;
+
+use super::signal;
 
 // ── Gap ───────────────────────────────────────────────────────────────────────
 
@@ -68,6 +71,7 @@ impl Gap {
     pub(crate) fn dependencies(&self) -> &[Box<str>] { &self.dependencies }
     pub(crate) fn constraints(&self) -> Option<&Value> { self.constraints.as_ref() }
     pub(crate) fn expected_output(&self) -> Option<&str> { self.expected_output.as_deref() }
+    pub(crate) fn set_state(&mut self, state: GapState) { self.state = state; }
 }
 
 // ── Evidence ──────────────────────────────────────────────────────────────────
@@ -107,6 +111,7 @@ pub(crate) struct Blackboard {
     name_index: DashMap<Box<str>, Uuid>,
     evidences: DashMap<Uuid, Vec<Evidence>>,
     gates: DashMap<Uuid, Value>,
+    tx: broadcast::Sender<signal::Payload>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -118,18 +123,20 @@ pub(crate) struct BlackboardSnapshot {
 }
 
 impl Blackboard {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(tx: broadcast::Sender<signal::Payload>) -> Self {
         Self {
             intent: Mutex::new(None),
             gaps: DashMap::new(),
             name_index: DashMap::new(),
             evidences: DashMap::new(),
             gates: DashMap::new(),
+            tx,
         }
     }
 
     pub(crate) fn set_intent(&self, intent: impl Into<Box<str>>) {
         *self.intent.lock().unwrap() = Some(intent.into());
+        let _ = self.tx.send(self.snapshot_json());
     }
 
     pub(crate) fn get_intent(&self) -> Option<Box<str>> {
@@ -147,19 +154,22 @@ impl Blackboard {
         let name = gap.name.clone();
         self.gaps.insert(id, gap);
         self.name_index.insert(name, id);
+        let _ = self.tx.send(self.snapshot_json());
         Ok(())
     }
 
-    pub(crate) fn set_gap_state(&self, gap_id: &Uuid, state: GapState) -> Result<(), MossError> {
+    pub(crate) fn set_gap_state(&self, gap_id: &Uuid, new_state: GapState) -> Result<(), MossError> {
         self.gaps
             .get_mut(gap_id)
             .ok_or_else(|| MossError::Blackboard(format!("gap {gap_id} not found")))?
-            .state = state;
+            .set_state(new_state);
+        let _ = self.tx.send(self.snapshot_json());
         Ok(())
     }
 
     pub(crate) fn append_evidence(&self, ev: Evidence) {
         self.evidences.entry(ev.gap_id()).or_default().push(ev);
+        let _ = self.tx.send(self.snapshot_json());
     }
 
     pub(crate) fn get_gap(&self, gap_id: &Uuid) -> Option<Gap> {
@@ -224,12 +234,9 @@ impl Blackboard {
         self.gaps.iter().all(|g| g.state == GapState::Closed)
     }
 
-    pub(crate) fn all_gated_or_closed(&self) -> bool {
-        self.gaps.iter().all(|g| matches!(g.state, GapState::Gated | GapState::Closed))
-    }
-
     pub(crate) fn insert_gate(&self, gap_id: Uuid, payload: Value) {
         self.gates.insert(gap_id, payload);
+        let _  = self.tx.send(self.snapshot_json());
     }
 
     pub(crate) fn all_evidence(&self) -> Vec<Evidence> {
@@ -247,6 +254,10 @@ impl Blackboard {
             gates: self.gates.iter().map(|e| (*e.key(), e.value().clone())).collect(),
         }
     }
+
+    fn snapshot_json(&self) -> Box<str> {
+        serde_json::to_string(&self.snapshot()).unwrap_or_default().into()
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -255,6 +266,9 @@ impl Blackboard {
 mod tests {
     use super::*;
     use serde_json::json;
+    use crate::moss::signal;
+
+    fn bb() -> Blackboard { Blackboard::new(signal::channel(1).0) }
 
     fn gap(name: &str, deps: Vec<&str>) -> Gap {
         Gap::new(
@@ -270,7 +284,7 @@ mod tests {
     #[test]
     fn linear_chain_promote_unblocked() {
         // A → B → C
-        let bb = Blackboard::new();
+        let bb = bb();
         bb.insert_gap(gap("A", vec![])).unwrap();
         bb.insert_gap(gap("B", vec!["A"])).unwrap();
         bb.insert_gap(gap("C", vec!["B"])).unwrap();
@@ -298,7 +312,7 @@ mod tests {
     #[test]
     fn parallel_fanout_drain_ready() {
         // X and Y are independent — both start Ready
-        let bb = Blackboard::new();
+        let bb = bb();
         bb.insert_gap(gap("X", vec![])).unwrap();
         bb.insert_gap(gap("Y", vec![])).unwrap();
 
@@ -312,24 +326,24 @@ mod tests {
     }
 
     #[test]
-    fn all_gated_or_closed() {
-        let bb = Blackboard::new();
+    fn all_closed_only_when_all_gaps_closed() {
+        let bb = bb();
         bb.insert_gap(gap("P", vec![])).unwrap();
         bb.insert_gap(gap("Q", vec![])).unwrap();
 
-        assert!(!bb.all_gated_or_closed());
+        assert!(!bb.all_closed());
 
         let p_id = bb.get_gap_id_by_name("P").unwrap();
         let q_id = bb.get_gap_id_by_name("Q").unwrap();
-        bb.set_gap_state(&p_id, GapState::Gated).unwrap();
+        bb.set_gap_state(&p_id, GapState::Closed).unwrap();
+        assert!(!bb.all_closed());
         bb.set_gap_state(&q_id, GapState::Closed).unwrap();
-
-        assert!(bb.all_gated_or_closed());
+        assert!(bb.all_closed());
     }
 
     #[test]
     fn append_and_get_evidence() {
-        let bb = Blackboard::new();
+        let bb = bb();
         let gap_id = Uuid::new_v4();
 
         bb.append_evidence(Evidence::new(gap_id, 1, json!({"result": 42}), EvidenceStatus::Success));

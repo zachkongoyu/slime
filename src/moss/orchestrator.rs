@@ -1,6 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use minijinja::{Environment, context};
+use tokio::sync::broadcast;
 use tracing::info;
 
 use crate::error::MossError;
@@ -9,19 +10,22 @@ use crate::providers::{Message, Role, Provider};
 use super::blackboard::{Blackboard, Gap};
 use super::decomposition::Decomposition;
 use super::runner::Runner;
+use super::signal;
 
 pub(crate) struct Orchestrator {
     provider: Arc<dyn Provider>,
     runner: Runner,
     blackboard: Mutex<Arc<Blackboard>>,
+    tx: broadcast::Sender<signal::Payload>,
 }
 
 impl Orchestrator {
-    pub(crate) fn new(provider: Arc<dyn Provider>) -> Self {
+    pub(crate) fn new(provider: Arc<dyn Provider>, tx: broadcast::Sender<signal::Payload>) -> Self {
         Self {
             provider: Arc::clone(&provider),
             runner: Runner::new(Arc::clone(&provider)),
-            blackboard: Mutex::new(Arc::new(Blackboard::new())),
+            blackboard: Mutex::new(Arc::new(Blackboard::new(tx.clone()))),
+            tx,
         }
     }
 
@@ -36,7 +40,7 @@ impl Orchestrator {
         } else {
             // TODO: Sealing the old blackboard
 
-            let fresh = Arc::new(Blackboard::new());
+            let fresh = Arc::new(Blackboard::new(self.tx.clone()));
             *self.blackboard.lock().unwrap() = Arc::clone(&fresh);
             fresh
         };
