@@ -16,6 +16,9 @@ Each phase has its own spec file. Phases are independently testable and ship in 
 | 6 | Signal Bus + Runner Rewrite | Done | [completed/phase-6.md](completed/phase-6.md) |
 | 7 | DefenseClaw | Done | [completed/phase-7-defense-claw.md](completed/phase-7-defense-claw.md) |
 | 8 | Agent Loop (Reactive Gaps) | Ready | [phase-8-agent-loop.md](phase-8-agent-loop.md) |
+| 8a | Provider Types + Tool-Calling | Ready | ↑ same file |
+| 8b | McpBridge (stdio transport) | Ready | ↑ same file |
+| 8c | MicroAgent + Executor wiring | Ready | ↑ same file |
 | 9 | Memory M1 | Planned | [phase-9-memory-m1.md](phase-9-memory-m1.md) |
 | 10 | Memory M2 + M3 | Planned | [phase-10-memory-m2-m3.md](phase-10-memory-m2-m3.md) |
 | 11 | HUD | Planned | [phase-11-hud.md](phase-11-hud.md) |
@@ -56,7 +59,7 @@ Key design decisions that shaped the phases:
 | 6b | `src/moss/runner.rs` |
 | 6c | `src/cli.rs` (new), `src/main.rs` (simplified to bootstrap), `src/lib.rs` (add `approve_gate`/`reject_gate`) |
 | 7 | `src/moss/defense_claw.rs` (new), `src/moss/runner.rs`, `src/moss/mod.rs` |
-| 8 | `src/providers/mcp.rs` (new), `src/moss/micro_agent.rs` (new), `src/moss/executor.rs`, `src/providers/remote/openrouter.rs` |
-| 9 | `src/memory/` (new), `src/main.rs` |
-| 10 | `Cargo.toml`, `src/memory/` |
-| 11 | `src/main.rs` |
+| 8a | `src/providers/mod.rs`, `src/providers/remote/openrouter.rs` |
+| 8b | `src/providers/mcp.rs` (new) |
+| 8c | `src/moss/micro_agent.rs` (new), `src/moss/executor.rs`, `src/moss/orchestrator.rs` |
+| 9 | `src/memory/` (new), `src/ma

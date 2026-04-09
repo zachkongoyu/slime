@@ -1,8 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::blackboard::GapType;
-
 /// The deserialized form of the LLM's decomposition output.
 #[derive(Debug, Deserialize, Serialize)]
 pub(crate) struct Decomposition {
@@ -16,7 +14,6 @@ pub(crate) struct Decomposition {
 pub(crate) struct GapSpec {
     pub(crate) name: String,
     pub(crate) description: String,
-    pub(crate) gap_type: GapType,
     pub(crate) dependencies: Vec<String>,
     pub(crate) constraints: Option<Value>,
     pub(crate) expected_output: Option<String>,

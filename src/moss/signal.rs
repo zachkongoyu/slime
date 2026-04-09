@@ -11,6 +11,12 @@ pub enum Event {
         gap_name: Box<str>,
         reason: Box<str>,
     },
+    /// The Solver asked the human a question (via an `~~~ask` block).
+    QuestionAsked {
+        gap_id: uuid::Uuid,
+        gap_name: Box<str>,
+        question: Box<str>,
+    },
 }
 
 pub type Payload = Event;

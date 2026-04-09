@@ -1,7 +1,7 @@
 # Moss AIOS — Architecture Specification
 
-**Version:** 0.7.0
-**Date:** 2026-04-07
+**Version:** 0.9.0
+**Date:** 2026-04-09
 **Status:** Living document — each component is marked with its implementation status.
 
 **Status legend:**
@@ -23,8 +23,8 @@ The system follows the **Blackboard architecture pattern** (Hearsay-II lineage):
 ### 1.1 Design Principles
 
 1. **Living Blackboard.** A Blackboard is a workspace, not a transaction. It stays open across follow-up messages: the Orchestrator appends new Gaps and refines the intent as the conversation evolves. The Gap array only grows — Gaps are never removed. A new Blackboard is created only when the Orchestrator determines the user's query is unrelated to the current workspace, or when the session ends.
-2. **Code as the universal solver.** Every Gap is resolved by generating and executing code (a deterministic script or a reactive agent loop), not by prompting the LLM to "think harder."
-3. **Failure containment.** A failing Gap does not corrupt the global Blackboard. Reactive tasks run inside encapsulated Micro-Agent instances running an isolated ReAct loop.
+2. **Code as the universal solver.** Every Gap is handled by the Solver — a unified iterative loop where the LLM generates and executes code until the task is complete or a ceiling is reached. No fixed tool menu, no predefined actions. Code is the universal primitive.
+3. **Failure containment.** A failing code block within a Solver iteration does not lose context — the error output appears in the next iteration's prompt, enabling automatic recovery. A failing Gap does not corrupt the Blackboard.
 4. **Concurrency by default.** Independent Gaps execute in parallel via `tokio::JoinSet`. The DAG structure — not a global lock — determines ordering.
 5. **Defense in depth.** All generated artifacts pass through `ArtifactGuard` before execution.
 
@@ -36,7 +36,7 @@ The system follows the **Blackboard architecture pattern** (Hearsay-II lineage):
 L5  Interface          CLI daemon, HUD delta streamer
 L4  Orchestrator       Intent decomposition, DAG management, drive_gaps, response synthesis
 L3  Blackboard         Living workspace: Gaps (append-only), Evidence, mutable intent, HITL approvals
-L2  Compiler/Executor  Gap-to-artifact compilation, sandboxed execution
+L2  Solver             Unified iterative execution loop: LLM writes code, Solver runs it, iterates until done
 L1  Memory             Session context (M1), local DB (M2), vector store (M3)
 L0  Infrastructure     LLM providers, MCP bridge, ArtifactGuard scanner
 ```
@@ -63,7 +63,7 @@ The strategic coordinator. `Orchestrator::run` is the single entry point: decomp
 | Context injection (M1/M3 retrieval before planning) | `PLANNED` | — |
 
 **L3 — Blackboard** `PARTIAL`
-Living workspace using `DashMap` for lock-free concurrent access. Holds the intent (mutable), the Gap DAG (append-only), accumulated Evidence, and human-in-the-loop Gates. A Blackboard stays open across follow-up messages — new Gaps are inserted and the intent is refined on each decompose call. It is sealed only when the topic changes or the session ends (see Section 10).
+Living workspace using `DashMap` for lock-free concurrent access. Holds the intent (mutable), the Gap DAG (append-only), accumulated Evidence, and human-in-the-loop Gates. A Blackboard stays open across follow-up messages — new Gaps are inserted and the intent is refined on each decompose call. It is sealed only when the topic changes or the session ends (see Section 9).
 
 | Sub-component | Status | Notes |
 |---|---|---|
@@ -72,16 +72,14 @@ Living workspace using `DashMap` for lock-free concurrent access. Holds the inte
 | Dependency resolution (auto-unblock) | `IMPLEMENTED` | `promote_unblocked`, `drain_ready`, `all_closed` — unit tested. `all_gated_or_closed` removed (ADR-007). |
 | Signal Bus integration | `IMPLEMENTED` | Every `Blackboard` mutation emits `Event::Snapshot` via broadcast. `Orchestrator` emits `Event::ApprovalRequested` on HITL gate. `register_approval()`/`approve()` manage the `oneshot` pair. |
 
-**L2 — Compiler & Executor** `IMPLEMENTED`
-The Compiler takes a Gap description and emits an executable artifact. The Executor runs it and posts Evidence back to the Blackboard. The execution loop (`drive_gaps`) lives on the Orchestrator.
+**L2 — Solver** `PLANNED`
+The Solver is the unified execution component that replaces the former Compiler + Executor + Artifact split (see ADR-009). For every Gap, the Solver runs a bounded loop: render `solver.md` with the gap context and current working memory, call the LLM, parse the response into one of three step types (`Code`, `Ask`, `Done`), and act accordingly. Simple Gaps finish in one iteration; complex Gaps iterate up to a ceiling derived from `GapType`.
 
 | Sub-component | Status | Notes |
 |---|---|---|
-| Compiler | `IMPLEMENTED` | `compiler.rs` — renders `prompts/compiler.md`, calls LLM, deserializes into `Artifact` (Script or Agent). Language-agnostic. |
-| Executor — script runner | `IMPLEMENTED` | `executor.rs` — zero-size unit struct. Writes code to `NamedTempFile`, spawns interpreter via `tokio::process::Command`, bounded by `tokio::time::timeout`. Writes Evidence to Blackboard. |
-| Execution loop | `IMPLEMENTED` | Absorbed into `Orchestrator::drive_gaps()` — `runner.rs` deleted. |
-| Executor — Micro-Agent host (ReAct loop) | `PLANNED` | Stub in `executor.rs` — writes Failure evidence. Phase 8. |
-| Sandbox / isolation | `PLANNED` | — |
+| Solver loop + step parser | `PLANNED` | `solver.rs` — struct, loop, `Code`/`Ask`/`Done` parser, scratch extraction |
+| Solver prompt | `PLANNED` | `prompts/solver.md` — fixed frame with gap context + working memory + last output slots |
+| Sandbox / isolation | `PLANNED` | subprocess with restricted env, cgroups/ulimit |
 
 **L1 — Memory** `PLANNED`
 Three-tier memory hierarchy for context across and within sessions.
@@ -107,7 +105,7 @@ Three-tier memory hierarchy for context across and within sessions.
 
 This is the central execution flow that ties L4, L3, and L2 together. It is called once per user message. The same Blackboard may pass through this loop many times across follow-up messages.
 
-`IMPLEMENTED` — `Moss::run` → `Orchestrator::run` → `decompose` → gap insertion → `drive_gaps` (Compiler → ArtifactGuard → Executor per gap, including HITL round-trip) → `synthesize`. Full end-to-end loop implemented and running.
+`IMPLEMENTED` (Compiler/Executor path, to be replaced) / `PLANNED` (Solver) — `Moss::run` → `Orchestrator::run` → `decompose` → gap insertion → `drive_gaps` (Solver per gap, including HITL round-trip) → `synthesize`.
 
 ### 3.1 Sequence
 
@@ -152,16 +150,18 @@ User input
     |   6b. drain_ready() — poll Blackboard for all Ready Gaps
     |   6c. For each Ready Gap, spawn into tokio::JoinSet:
     |       6c-i.    Mark Gap as Assigned
-    |       6c-ii.   Send Gap to Compiler (LLM call)
-    |       6c-iii.  Compiler returns artifact (Script or AgentSpec)
-    |       6c-iv.   ArtifactGuard scans artifact
-    |       6c-v.    If Gated: Gap → Gated, insert Gate (fires broadcast to CLI),
-    |                await human response on oneshot channel (this is just I/O —
-    |                the task stays on the JoinSet like any other async wait)
-    |       6c-vi.   If Rejected: post Failure evidence, Gap → Closed, return
-    |       6c-vii.  Executor runs artifact
-    |       6c-viii.  Executor posts Evidence to Blackboard
-    |       6c-ix.   Gap → Closed
+    |       6c-ii.   Solver::run(gap, blackboard) — unified bounded loop:
+    |                  render solver.md (fixed frame + working memory + last output)
+    |                  provider.complete_chat
+    |                  parse step (Code | Ask | Done)
+    |                  Code → ArtifactGuard.scan → execute subprocess → append stdout/stderr → loop
+    |                  Ask  → register_approval (fires ApprovalRequested broadcast)
+    |                         await oneshot → append answer → loop
+    |                         (gap task stays alive on JoinSet; other gaps proceed)
+    |                  Done → post Evidence to Blackboard, exit loop
+    |                  If scan verdict is Gated: same flow as Ask above
+    |                  If scan verdict is Rejected: post Failure evidence, exit loop
+    |       6c-iii.  Gap → Closed
     |   6d. If JoinSet is empty:
     |       - all Gaps Closed → done
     |       - else → deadlock
@@ -200,7 +200,6 @@ User input
 ```rust
 pub(crate) struct Orchestrator {
     provider: Arc<dyn Provider>,
-    compiler: Arc<Compiler>,
     guard: Arc<ArtifactGuard>,
     blackboard: Mutex<Arc<Blackboard>>,
     tx: broadcast::Sender<signal::Payload>,
@@ -265,12 +264,12 @@ The LLM always returns `{ intent, is_follow_up, gaps[] }`. `is_follow_up` is the
 For the first message in a session (no board exists), this is `{}`.
 
 **Prompt contract:**
-- `prompts/decompose.md` — Markdown instructions + XML-tagged input (`{{ user_query }}`, `{{ blackboard_state }}`). The prompt instructs the LLM to refine the intent on follow-ups, return only new Gaps, and avoid reusing names already on the board. See Section 10 for the full lifecycle.
+- `prompts/decompose.md` — Markdown instructions + XML-tagged input (`{{ user_query }}`, `{{ blackboard_state }}`). The prompt instructs the LLM to refine the intent on follow-ups, return only new Gaps, and avoid reusing names already on the board. See Section 9 for the full lifecycle.
 - `prompts/synthesize.md` — Markdown instructions + XML-tagged input (`{{ intent }}`, `{{ evidence }}`). The `intent` is always the latest (refined) version. LLM returns a plain text response.
 
 ### 4.2 Blackboard `IMPLEMENTED`
 
-**Responsibility:** Living workspace for the current conversation thread. Holds the intent (mutable), the Gap DAG (append-only), Evidence map, and HITL Gates. A Blackboard stays open across follow-up messages — the Orchestrator inserts new Gaps and updates the intent on each decompose call. It is sealed only when the topic changes or the session ends (see Section 10).
+**Responsibility:** Living workspace for the current conversation thread. Holds the intent (mutable), the Gap DAG (append-only), Evidence map, and HITL Gates. A Blackboard stays open across follow-up messages — the Orchestrator inserts new Gaps and updates the intent on each decompose call. It is sealed only when the topic changes or the session ends (see Section 9).
 
 **Current state:** Core data structures, insert/mutate operations, dependency resolution, ready-gap polling, signal bus integration, and HITL approval flow are implemented and unit tested.
 
@@ -307,12 +306,6 @@ impl Blackboard {
 
 All Blackboard mutation methods (`set_gap_state`, `insert_gap`, `append_evidence`, `set_intent`) emit `Event::Snapshot` via the broadcast channel after each write. Consumers (CLI, HUD, logger) subscribe independently — the Blackboard doesn't know or care who's listening.
 
-**Removed:** `all_gated_or_closed()` — no longer needed. The execution loop's terminal condition is `all_closed()`. Gated gaps stay alive on the JoinSet as async I/O waits; `drive_gaps` has no gate-specific logic (see ADR-005, ADR-007).
-
-**Removed:** `subscribe()` from Blackboard — subscription is now on `Moss::subscribe()` (ADR-008).
-
-**Removed:** `insert_gate()` — replaced by `register_approval()` + `approve()`. The Orchestrator creates the `oneshot` pair directly and emits `Event::ApprovalRequested` via `signal_tx()`.
-
 **Name→UUID reverse index:**
 `Gap.dependencies` stores names (`Vec<Box<str>>`), but the gap map is keyed by `Uuid`. A secondary index `name_index: DashMap<Box<str>, Uuid>` is populated atomically in `insert_gap` alongside the primary map. This makes `promote_unblocked` O(D) per gap (D = dependency count) instead of O(N·D) with a scan. The index is append-only — gap names are immutable after insertion.
 
@@ -327,7 +320,7 @@ pub(crate) struct Gap {
     gap_id: Uuid,
     name: Box<str>,              // snake_case slug from the plan
     state: GapState,
-    description: Box<str>,       // consumed by the Compiler
+    description: Box<str>,       // consumed by the Solver
     gap_type: GapType,           // Proactive or Reactive
     dependencies: Vec<Box<str>>, // names of gaps this depends on
     constraints: Option<Value>,
@@ -352,109 +345,67 @@ pub(crate) struct Evidence {
 pub(crate) enum EvidenceStatus {
     Success,
     Failure { reason: String },
-    Partial,                     // Micro-Agent hit iteration cap before goal was met
+    Partial,                     // Solver hit iteration ceiling before gap was resolved
 }
 ```
 
-`Blackboard.evidences` is `DashMap<Uuid, Vec<Evidence>>` — an ordered attempt log per gap. The Compiler for retry attempt N receives the `Vec<Evidence>` slice `[0..N-1]` so it can see prior errors and adapt.
+`Blackboard.evidences` is `DashMap<Uuid, Vec<Evidence>>` — an ordered attempt log per gap. The Solver on retry iteration N sees the prior `Evidence` records in context so it can adapt.
 
 `Blackboard` includes `name_index: DashMap<Box<str>, Uuid>` for O(1) name-to-ID resolution. Written once in `insert_gap`, never mutated after that. `intent` is stored as `Mutex<Option<Box<str>>>` for safe mutation through a shared `&self` reference. `pending_approvals: DashMap<Uuid, oneshot::Sender<bool>>` stores the sender half of each HITL oneshot channel until `approve()` is called.
 
 **Thread-safety model:**
 `DashMap` provides per-shard read/write locks internally. Individual Gap state transitions (Ready -> Assigned) must be atomic. Use `DashMap::get_mut` which holds a write lock on the shard for the duration of the returned `RefMut`. The `drain_ready` method should iterate and CAS (compare-and-swap) in a single pass to avoid TOCTOU races where two threads both see the same gap as Ready.
 
-### 4.3 Compiler `IMPLEMENTED`
+### 4.3 Solver `PLANNED`
 
-**Responsibility:** Accept a Gap description and emit an executable artifact — either a self-contained script (Proactive) or a Micro-Agent specification (Reactive).
+**Responsibility:** Execute a single Gap from the Blackboard to a final Evidence record. Replaces the former Compiler + Executor + Artifact split (ADR-009). The Solver owns the complete execution lifecycle for one Gap: it renders the prompt, calls the LLM, parses the step, acts, and iterates until the LLM emits `Done` or the iteration ceiling is reached.
+
+**Lifecycle:** The Orchestrator does not hold a Solver as a field. `drive_gaps` constructs one Solver per ready Gap and spawns it into the JoinSet. A Solver lives for exactly one Gap and is dropped when the loop exits. The Orchestrator's `provider` and `guard` are cloned (`Arc`) into each Solver.
 
 **Interface:**
 
 ```rust
-pub(crate) struct Compiler {
+pub(crate) struct Solver {
     provider: Arc<dyn Provider>,
+    guard: Arc<ArtifactGuard>,
 }
 
-#[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
-pub(crate) enum Artifact {
-    Script {
-        language: Box<str>,  // "python3", "bash", "node", etc.
-        code: Box<str>,
-        timeout_secs: u64,
-    },
-    Agent {
-        role: Box<str>,
-        goal: Box<str>,
-        tools: Vec<Box<str>>,  // MCP tool names
-        instructions: Box<str>,
-        // max_iterations and timeout are PLANNED — Agent execution is a stub
-    },
-}
+impl Solver {
+    pub(crate) fn new(provider: Arc<dyn Provider>, guard: Arc<ArtifactGuard>) -> Self;
 
-impl Compiler {
-    /// Compile a Gap into an executable Artifact.
-    /// `prior_attempts` contains error reason strings from previous failed runs (empty on first attempt).
-    pub(crate) async fn compile(&self, gap: &Gap, prior_attempts: &[Box<str>]) -> Result<Artifact, MossError>;
+    /// Run the unified execution loop for `gap`.
+    /// Posts Evidence to `blackboard` and marks the Gap Closed on exit.
+    /// The iteration ceiling is derived from `gap.gap_type` (Proactive → lower, Reactive → higher).
+    pub(crate) async fn run(&self, gap: &Gap, blackboard: &Blackboard) -> Result<(), MossError>;
 }
 ```
 
-**Prompt contract (`compiler.md`):**
-The Compiler prompt receives the gap name, description, type, and prior error strings. It returns a JSON object with `type` (`SCRIPT` or `AGENT`) and the relevant payload fields (`language`, `code`, `timeout_secs` for scripts; `role`, `goal`, `tools`, `instructions` for agents).
+**Step model — exactly three variants:**
 
-**Design decisions:**
-- The Compiler must not have access to the full Blackboard — only the specific Gap description and its resolved dependency Evidence. This enforces the principle of least privilege and keeps the LLM context window focused.
-- Script artifacts are self-contained: they must include all imports, accept input via stdin or environment variables, and write output to stdout as JSON.
-- Agent specs are declarative: they describe *what* the agent should achieve, not the exact steps. The Executor's agent runtime interprets the spec.
+| Step | Parser match | Loop behavior |
+|------|-------------|---------------|
+| `Code` | fenced code block (`` ```lang ... ``` ``) | `guard.scan` → execute subprocess → append stdout/stderr to next prompt → loop |
+| `Ask`  | `~~~ask ... ~~~` block | `blackboard.register_approval(question)` → await oneshot → append answer → loop |
+| `Done` | JSON object containing `"done"` key | post Evidence using the `done` value (or last stdout), mark Gap Closed, return |
 
-### 4.4 Executor `PARTIAL`
+An optional `~~~scratch ... ~~~` block appended to any response replaces the `working_memory` slot in the next iteration's prompt. The LLM programs its own context compression this way.
 
-**Responsibility:** Run artifacts in isolation and produce Evidence. Script path is fully implemented; Agent path is a stub.
+**Prompt contract (`solver.md`):**
+Three slots, fixed frame, no LLM mutation allowed:
+1. **Fixed frame** — environment description, output contract, parser rules (never changes).
+2. **Working memory** — owned by the LLM, rewritten by the `scratch` side-channel. Carries strategy, progress, remaining steps.
+3. **Last execution output** — only the most recent Code step's stdout/stderr. Prior outputs drop from context.
 
-**Interface:**
+**Execution model:**
+1. Render `solver.md` template with gap context, current `working_memory`, and `last_output`.
+2. Call `provider.complete_chat`.
+3. Parse response into `(step, Option<new_working_memory>)`.
+4. If `Code`: `guard.scan(code)` → on `Approved` or `Gated` (after user approves), write to `NamedTempFile`, spawn `tokio::process::Command`, capture stdout/stderr, update `last_output`.
+5. If `Ask`: register approval gate, await human response, update `last_output`.
+6. If `Done`: serialize evidence from the `done` value (or last stdout), call `blackboard.append_evidence`, return.
+7. On iteration ceiling: post `EvidenceStatus::Partial` and return.
 
-```rust
-/// Zero-size unit struct — stateless, no LLM, no shared state.
-#[derive(Clone, Copy)]
-pub(crate) struct Executor;
-
-impl Executor {
-    /// Run an artifact and write Evidence to the Blackboard directly.
-    /// Script path: fully implemented. Agent path: stub — writes Failure evidence.
-    pub(crate) async fn run(
-        &self,
-        gap: &Gap,
-        artifact: &Artifact,
-        blackboard: &Blackboard,
-    ) -> Result<(), MossError>;
-}
-```
-
-**Script execution model:**
-1. Write the script to a temporary file inside a sandbox directory.
-2. Spawn a child process (`tokio::process::Command`) with restricted environment: no network access for Proactive scripts (they receive all data via stdin), bounded CPU time via `timeout`, bounded memory via cgroups or ulimit.
-3. Capture stdout as JSON. Parse into `Evidence.content`.
-4. If the process exits non-zero or times out, return an error Evidence with the stderr content, and let the Orchestrator decide whether to retry or fail the gap.
-
-**Micro-Agent execution model:**
-1. The `Compiler` returns `Artifact::AgentSpec { goal, tools, instructions, max_iterations, timeout }`.
-2. `Executor::run()` constructs `MicroAgent { goal, tools, max_iterations, provider, context }` where `context` is the read-only dependency Evidence passed in. No sub-Blackboard is created.
-3. `MicroAgent::run()` executes a ReAct loop using an internal `Vec<Message>` as local scratch memory. This history never touches the parent Blackboard.
-4. Each iteration: LLM call with tool definitions scoped to `tools` → LLM returns tool call or final answer → if tool call, invoke via `McpBridge` → append observation to history → check if goal is met.
-5. On exit (goal met or `max_iterations` exhausted): serialize the final answer and key observations into a single `Evidence` record. Internal history is discarded. Evidence is returned to the Executor, which posts it to the parent Blackboard and marks the Gap Closed.
-
-```rust
-pub struct MicroAgent {
-    goal: String,
-    tools: Vec<String>,          // permitted MCP tool names only — least privilege
-    max_iterations: u32,
-    provider: Arc<dyn Provider>, // same provider pool, no new Orchestrator
-    context: Vec<Evidence>,      // dependency Evidence — read-only input
-    history: Vec<Message>,       // internal scratch — never written to Blackboard
-}
-
-impl MicroAgent {
-    pub async fn run(mut self, mcp: &McpBridge) -> Result<Evidence>;
-}
-```
+**Design note:** The Solver receives only the specific Gap description and dependency Evidence — not the full Blackboard. Principle of least privilege is preserved.
 
 ### 4.5 DAG Scheduler
 
@@ -466,9 +417,8 @@ The scheduler is not a separate component — it is `Orchestrator::drive_gaps` (
 
 | Failure type | Behavior |
 |---|---|
-| Script exits non-zero | Retry up to N times (default 2). The error stderr is stored as `EvidenceStatus::Failure { reason }`. On each retry, `compiler.compile(gap, prior_attempts)` receives all prior failure records so it can adapt the generated code. After N failures, mark Gap as Closed with `EvidenceStatus::Failure` and propagate to dependents. |
-| Micro-Agent exceeds iteration cap | Serialize partial history as a summary. Mark Closed with `EvidenceStatus::Partial`. |
-| Micro-Agent exceeds timeout | Abort MicroAgent ReAct loop, collect partial history as Evidence. Mark Closed with `EvidenceStatus::Partial`. |
+| Code block exits non-zero (within Solver) | The error output is appended to the next iteration's context. The Solver loop continues — the LLM sees the error and can adapt. After `max_iterations` (derived from `GapType`), mark Gap Closed with `EvidenceStatus::Failure` and propagate to dependents. |
+| Solver hits iteration ceiling | Serialize last working memory + last output as partial Evidence. Mark Closed with `EvidenceStatus::Partial`. |
 | LLM provider error (rate limit, timeout) | Exponential backoff with jitter, up to 3 retries. |
 | Deadlock (Blocked gaps remain, no Ready/Assigned/Gated) | Return `MossError::Deadlock`. Log full DAG state. |
 
@@ -546,45 +496,21 @@ pub trait Provider: Send + Sync {
 
 **Remaining work:**
 - **Streaming.** `PLANNED` — For the HUD to stream partial responses, add `complete_chat_stream` returning a `Stream<Item = Result<String>>`.
-- **Tool calling.** `PLANNED` — `complete_with_tools` stub exists; full implementation is required for the Micro-Agent's ReAct loop.
+- **Tool calling.** `PLANNED` — `complete_with_tools` stub exists; not required for the Solver (which generates code directly rather than selecting from a tool menu). Reserved for future MCP integration if that phase is ever pursued.
 
 ---
 
-## 7. MCP Integration `PLANNED`
+## 7. MCP Integration `DEFERRED`
 
 MCP (Model Context Protocol) is the standardized bridge between the LLM and external tools (filesystem, browser, APIs, databases).
 
-**Design:**
-
-```rust
-pub struct McpBridge {
-    servers: Vec<McpServerHandle>,
-    tool_registry: HashMap<String, ToolDefinition>,
-}
-
-impl McpBridge {
-    /// Discover all tools from connected MCP servers.
-    pub async fn discover(&mut self) -> Result<()>;
-
-    /// Invoke a tool by name with JSON arguments.
-    pub async fn call(&self, tool_name: &str, args: Value) -> Result<Value>;
-
-    /// Return tool definitions formatted for LLM function-calling.
-    pub fn tool_definitions(&self) -> Vec<ToolDefinition>;
-}
-```
-
-**Transport:** JSON-RPC 2.0 over stdio (spawn MCP server as a child process and communicate via stdin/stdout). This is the standard MCP transport.
-
-**Dependency:** `mcp-rust-sdk` or manual JSON-RPC implementation over `tokio::process::Command`.
-
-**Tool scoping:** The Executor provides each Micro-Agent only the tools listed in its `AgentSpec.tools` field. This prevents a web-browsing agent from accessing the filesystem, and a file-management agent from making network calls.
+Deferred beyond Phase 8. Per ADR-009, the Solver's code-generation approach makes MCP unnecessary for the core execution loop — the LLM writes `requests.get(...)` directly rather than picking from a fixed tool menu. MCP integration, if ever needed, becomes a future capability layer that the Solver's generated code calls into, scoped per-gap for least privilege.
 
 ---
 
 ## 8. Security: ArtifactGuard `IMPLEMENTED`
 
-`ArtifactGuard` (`src/moss/artifact_guard.rs`) is the pre-execution scanner that inspects every artifact before the Executor runs it. It is a zero-field unit struct with all policy encoded as constants. The conceptual security layer is still called "DefenseClaw" in design discussions; the struct name in code is `ArtifactGuard`. It operates as a pipeline of checks, any of which can reject the artifact.
+`ArtifactGuard` (`src/moss/artifact_guard.rs`) is the pre-execution scanner that inspects every code block before the Solver runs it. It is a zero-field unit struct with all policy encoded as constants. The conceptual security layer is still called "DefenseClaw" in design discussions; the struct name in code is `ArtifactGuard`. It operates as a pipeline of checks, any of which can reject the block.
 
 **Scan pipeline:**
 
@@ -625,83 +551,15 @@ impl ArtifactGuard {
 }
 ```
 
-**Non-goals:** ArtifactGuard is not a sandbox. It is a static pre-flight check. Runtime isolation is the Executor's responsibility (subprocess with restricted env, cgroups, etc.). Defense in depth means both layers exist.
+**Non-goals:** ArtifactGuard is not a sandbox. It is a static pre-flight check per code block. Runtime isolation is the Solver's subprocess responsibility (restricted env, cgroups, etc.). Defense in depth means both layers exist.
 
 ---
 
-## 9. Session Lifecycle
+## 9. Session & Blackboard Lifecycle
 
-A **Session** is the lifetime of the running Moss process. It holds at most one active Blackboard at any time, plus references to Crystals produced from previously sealed Blackboards. A single session typically has few Blackboards — the active one stays open across follow-ups and is only sealed when the topic changes.
+A **Session** is the lifetime of the running Moss process. It holds at most one active Blackboard at any time. A Blackboard is a **workspace**, not a transaction — it stays open across follow-up messages. The Orchestrator appends new Gaps on each follow-up, and the intent evolves. A new Blackboard is created only when the Orchestrator determines the user has moved to an unrelated topic, or when the session ends. Sealed Blackboards are compressed into Knowledge Crystals (M3). The session has no idle timeout.
 
-```
-[Moss starts]
-      |
-      v
-  Create Session (new Uuid)
-      |
-      v
-  Wait for user input ◄──────────────────────────────────────┐
-      |                                                       │
-      v                                                       │
-  Is there an active Blackboard?                              │
-      |                                                       │
-   NO |          YES                                          │
-      |           |                                           │
-      v           v                                           │
-  Create new    Orchestrator.decompose()                      │
-  Blackboard    with full board state                         │
-      |           |                                           │
-      |      +---------+                                      │
-      |      |         |                                      │
-      |  Follow-up  New topic                                 │
-      |      |         |                                      │
-      |      |     Seal current board → Crystal → M3          │
-      |      |     Create new Blackboard                      │
-      |      |         |                                      │
-      +------+---------+                                      │
-      |                                                       │
-      v                                                       │
-  Update intent, insert new Gaps                              │
-  Runner.execute() (Active state)                             │
-      |                                                       │
-    +-+-----------------------------------+                   │
-    |                                     |                   │
-    v                                     v                   │
- All Gaps Closed                   Gated Gaps remain          │
-    |                              (user approval needed)     │
-    |                                     |                   │
-    |                         Surface Gates; await input      │
-    |                              approve / reject           │
-    |                                     |                   │
-    |                         Gap → Ready / Closed            │
-    |                                     |                   │
-    +<------------------------------------+                   │
-    |                                                         │
-    v                                                         │
-  Orchestrator.synthesize() → response (Idle state)           │
-  Return response to user                                     │
-      |                                                       │
-      └───────────────────────────────────────────────────────┘
-
-[Session ends only on user exit or process crash → seal active board]
-```
-
-**Key invariants:**
-- At most one Blackboard is active (Created/Active/Idle) per session at any time.
-- A Blackboard stays open across follow-up messages. It is sealed only on topic change or session end.
-- Gated interactions happen within the Blackboard's Active state — the board is never sealed while Gates are pending.
-- A Sealed Blackboard is an immutable historical record, compressed into a Crystal in M3.
-- The session has no idle timeout. It lives until the user exits or the process crashes.
-
-**Crystallization** happens when a Blackboard is sealed: the board's outcomes are compressed into a Knowledge Crystal saved to M3. Only Blackboards with at least one Closed Gap with `EvidenceStatus::Success` produce a Crystal.
-
----
-
-## 10. Blackboard Lifecycle
-
-A Blackboard is a **workspace**, not a transaction. It stays open across multiple user messages as long as the conversation remains related. The Orchestrator appends new Gaps on each follow-up, and the intent evolves to capture the growing scope. A new Blackboard is created only when the Orchestrator determines the user has moved to an unrelated topic, or when the session ends.
-
-### 10.1 Lifecycle States
+### 9.1 Lifecycle States
 
 ```
 Created ──> Active ──> Idle ──> Active  (follow-up adds new Gaps)
@@ -716,7 +574,7 @@ Created ──> Active ──> Idle ──> Active  (follow-up adds new Gaps)
 | **Idle** | All current Gaps have reached a terminal state (`Closed`). Synthesis has returned a response to the user. **The Blackboard remains writable** — new Gaps can be inserted on the next user message. It is waiting for input. |
 | **Sealed** | Crystallized and immutable. The Blackboard has been compressed into a Knowledge Crystal (M3) and is never written to again. |
 
-### 10.2 Lifecycle Transitions
+### 9.2 Lifecycle Transitions
 
 **Created → Active:** The first `orchestrator.decompose()` call sets the intent and inserts the initial Gaps. `drive_gaps` begins execution.
 
@@ -730,24 +588,9 @@ Created ──> Active ──> Idle ──> Active  (follow-up adds new Gaps)
 
 **Idle → Sealed (session end):** The user exits or the process crashes. The Blackboard is crystallized. (Sealing on exit is a TODO.)
 
-### 10.3 Intent Evolution
+### 9.3 Growable Gap DAG
 
-The Blackboard's `intent` is **mutable**. Each decompose call may refine it to reflect the user's evolving goal.
-
-```
-Round 1: "Book me a flight to Tokyo"
-  → intent: "Book a flight to Tokyo"
-
-Round 2: "Make it business class"
-  → intent: "Book a business class flight to Tokyo"
-
-Round 3: "Also find a hotel near Shibuya for 3 nights"
-  → intent: "Book a business class flight to Tokyo and a hotel near Shibuya for 3 nights"
-```
-
-The intent is a living summary of what the user is trying to accomplish on this Blackboard. The Orchestrator updates it on every decompose call. The synthesis step reads the current intent (not the original) to produce the final response.
-
-### 10.4 Growable Gap DAG
+The Blackboard's `intent` is **mutable** — each decompose call refines it. The synthesis step reads the current intent (not the original).
 
 Gaps are append-only. Once inserted, a Gap is never removed from the Blackboard. New Gaps are added on each follow-up, and they can reference any existing Gap by name in their `dependencies` field.
 
@@ -765,48 +608,13 @@ Round 3 inserts:
 
 The Gap DAG grows monotonically. Closed Gaps from prior rounds are inert — the Runner skips them. `promote_unblocked()` and `drain_ready()` naturally handle the mix of old Closed Gaps and new Ready/Blocked Gaps without any changes to the scheduling logic.
 
-**Name uniqueness:** Gap names must be unique across the entire Blackboard lifetime. The `name_index` enforces this. The decompose prompt instructs the LLM not to reuse names already on the board.
+**Name uniqueness:** Gap names must be unique across the entire Blackboard lifetime. The `name_index` enforces this.
 
-### 10.5 New-Topic Detection
+### 9.4 Ownership
 
-There is no separate classifier. The Orchestrator's `decompose` call returns `is_follow_up: bool` — the LLM decides based on the full Blackboard state in the prompt. `Orchestrator::run` reads this flag directly to decide whether to reuse the current board or create a fresh one.
+The Orchestrator is the sole creator of Blackboards. The Solver receives `Arc<Blackboard>` to read gap context and write Evidence.
 
-### 10.6 Ownership and Creation
-
-`Orchestrator` is the sole owner of the Blackboard lifecycle within a session. The Compiler and Executor receive `Arc<Blackboard>` and may read/write Gaps and Evidence, but only the Orchestrator creates Blackboards.
-
-```rust
-// As implemented — Orchestrator::run
-pub(crate) async fn run(&self, query: &str) -> Result<String, MossError> {
-    let board = self.blackboard.lock().unwrap().clone();
-
-    // Decompose — LLM sees full board snapshot, returns intent + is_follow_up + gaps
-    let decomposition = self.decompose(query, &board).await?;
-
-    // Reuse current board or create fresh one based on is_follow_up
-    let board = if decomposition.is_follow_up {
-        board
-    } else {
-        // TODO: seal old board → Crystal → M3
-        let fresh = Arc::new(Blackboard::new(self.tx.clone()));
-        *self.blackboard.lock().unwrap() = Arc::clone(&fresh);
-        fresh
-    };
-
-    if let Some(ref intent) = decomposition.intent {
-        board.set_intent(intent.as_str());
-    }
-    for spec in decomposition.gaps.unwrap_or_default() {
-        board.insert_gap(Gap::new(spec.name, spec.description, spec.gap_type, ...))?;
-    }
-
-    // JoinSet fan-out: Compiler → ArtifactGuard → (HITL?) → Executor per gap
-    self.drive_gaps(Arc::clone(&board)).await?;
-    self.synthesize(&board).await
-}
-```
-
-### 10.7 Invariants
+### 9.5 Invariants
 
 - A Blackboard's Gap array only grows. Gaps are never removed or replaced.
 - The intent is mutable — updated by the Orchestrator on each decompose call. The synthesis step always reads the latest intent.
@@ -816,7 +624,7 @@ pub(crate) async fn run(&self, query: &str) -> Result<String, MossError> {
 
 ---
 
-## 11. Gap Lifecycle
+## 10. Gap Lifecycle
 
 ```
 Blocked ──> Ready ──> Assigned ──> Gated ──> Ready  (on user approval)
@@ -831,7 +639,7 @@ This is a one-directional state machine. The only backward arc is `Gated → Rea
 |---|---|---|
 | **Blocked** | Gap has dependencies that are not yet Closed | All dependencies reach Closed state; auto-promoted to Ready by `promote_unblocked()` |
 | **Ready** | No unresolved dependencies; eligible for scheduling | Picked up by `drive_gaps` and marked Assigned |
-| **Assigned** | Compiler has been invoked; Executor is running | Executor posts Evidence and marks the gap Closed, OR ArtifactGuard gates the gap → Gated |
+| **Assigned** | Solver::run has been invoked | Solver posts Evidence and marks the gap Closed, OR ArtifactGuard gates a code block → Gated |
 | **Gated** | Gap needs human action (security approval, user input, judgment call, physical action). The gap task stays alive on the JoinSet awaiting a `oneshot` response — this is just async I/O. `drive_gaps` has no gate-specific logic. | User enters `y` at `[y/N]` prompt → task resumes execution; user enters `N` → Closed with terminal failure |
 | **Closed** | Terminal. The gap is resolved (success, terminal failure, or user rejection) | — |
 
@@ -841,9 +649,7 @@ This is a one-directional state machine. The only backward arc is `Gated → Rea
 
 ---
 
-## 12. Error Handling Strategy `PLANNED`
-
-The current codebase uses `.expect()` and `panic!()` pervasively. For a daemon process, panics are fatal. The error handling strategy going forward:
+## 11. Error Handling Strategy `IMPLEMENTED`
 
 **Crate-level error type:**
 
@@ -853,11 +659,8 @@ pub enum MossError {
     #[error("provider error: {0}")]
     Provider(#[from] ProviderError),
 
-    #[error("compiler error for gap {gap_id}: {reason}")]
-    Compiler { gap_id: Uuid, reason: String },
-
-    #[error("executor error for gap {gap_id}: {reason}")]
-    Executor { gap_id: Uuid, reason: String },
+    #[error("solver error for gap {gap_id}: {reason}")]
+    Solver { gap_id: Uuid, reason: String },
 
     #[error("defense scan rejected artifact: {reason}")]
     DefenseRejection { reason: String },
@@ -883,106 +686,37 @@ pub enum MossError {
 
 ---
 
-## 13. Architecture Decisions
+## 12. Architecture Decisions
 
-### ADR-001: Blackboard Pattern over Message-Passing Agents
+All ADRs live in `docs/ADR-*.md`. Key decisions:
 
-**Status:** Accepted
-
-**Context:** The system needs to coordinate multiple specialist tasks (web search, file operations, code generation) that operate on shared context. Two common patterns: (a) Blackboard — shared memory with a central coordinator reading/writing, (b) Actor/message-passing — each agent has private state and communicates via async channels.
-
-**Decision:** Blackboard pattern, implemented with `DashMap` for concurrent access.
-
-**Rationale:** The Orchestrator needs a global view of all Gaps and Evidence to make scheduling decisions and detect deadlocks. With message-passing, this global view requires either a centralized broker (which is functionally a Blackboard) or expensive all-to-all communication. The Blackboard makes the shared state explicit and inspectable, which simplifies debugging and enables the HUD to stream deltas directly from the data structure.
-
-**Trade-offs:** Blackboard contention under very high parallelism (mitigated by DashMap's per-shard locking). Less isolation between components than pure message-passing. The DashMap approach means we cannot trivially distribute across processes — this is acceptable for a single-machine AIOS.
-
-### ADR-002: Rust as Implementation Language
-
-**Status:** Accepted
-
-**Context:** The system is a local daemon with hard latency requirements (sub-second response to scheduling decisions) and concurrent execution of LLM calls, subprocesses, and tool invocations.
-
-**Decision:** Rust with Tokio async runtime.
-
-**Rationale:** Zero-cost async, no GC pauses, strong type system for modeling state machines (Gap lifecycle), and excellent subprocess management. The `DashMap` + `tokio::JoinSet` combination gives us concurrent DAG execution without manual thread management.
-
-**Trade-offs:** Slower iteration speed than Python. Smaller ecosystem for LLM tooling (though `async-openai` and the MCP Rust SDK exist). Higher learning curve for contributors.
-
-### ADR-003: LLM-Generated Code as the Execution Primitive
-
-**Status:** Accepted
-
-**Context:** Gaps need to be resolved by "doing something" — calling APIs, transforming data, navigating websites. Options: (a) a fixed toolkit of Rust-native functions the LLM selects from, (b) LLM generates executable code (scripts) on the fly.
-
-**Decision:** LLM generates code. The Compiler produces Python scripts or agent specs.
-
-**Rationale:** A fixed toolkit scales linearly with development effort and suffers from selection errors as it grows (the LLM must choose from an ever-larger menu). Code generation scales with the LLM's capability: as models improve, the range of solvable Gaps expands without code changes to Moss. Scripts are also inspectable and auditable (logged to M2).
-
-**Trade-offs:** Security risk from executing LLM-generated code (mitigated by DefenseClaw + sandboxing). Latency overhead of an extra LLM call per Gap (mitigated by parallelism). Debugging is harder when the execution logic is generated at runtime.
-
-### ADR-004: Micro-Agent = ReAct Loop, Not Recursive Orchestrator
-
-**Status:** Accepted
-
-**Context:** Reactive Gaps require non-deterministic real-world interaction (web browsing, API discovery, multi-step tool use). The initial design proposed spawning a recursive Orchestrator + Blackboard pair for each Reactive Gap.
-
-**Decision:** A Reactive Gap is executed by a `MicroAgent` running a ReAct (Reason → Act → Observe) loop. It does not instantiate a new Orchestrator, does not have a sub-Blackboard, and does not call the Compiler. The only output is a single `Evidence` record posted to the parent Blackboard.
-
-**Rationale:** The Blackboard pattern exists to coordinate parallel planning across multiple independent tasks. A ReAct loop is inherently sequential and self-contained. Giving it a full Orchestrator adds two extra LLM calls (decompose + synthesize), a sub-Blackboard that has no observability from the parent, and unbounded recursion risk. The MicroAgent struct is simpler, faster to implement, and its entire execution is scoped to one Gap.
-
-**Trade-offs:** A MicroAgent cannot itself spawn parallel sub-tasks. If a Reactive Gap is genuinely complex enough to warrant parallel decomposition, it should be decomposed at planning time by the Orchestrator into multiple Gaps — not at runtime inside a MicroAgent.
-
-### ADR-005: Human-in-the-Loop via `GapState::Gated`
-
-**Status:** Accepted — updated by ADR-007 (HITL gating as I/O).
-
-**Context:** Some Gap actions require human involvement before they can proceed. This includes security-sensitive actions (deleting files, sending email, making purchases) flagged by DefenseClaw, but also any situation where the system needs human input, judgment, or physical action (entering a 2FA code, choosing between options, confirming a preference).
-
-**Decision:** When any component determines a Gap needs human action, the Gap transitions to `Gated` state and a Gate is inserted into the Blackboard (which emits `Signal::GateRequested` via the `SignalBus` — see ADR-008). The gap task **stays alive on the JoinSet**, awaiting the human response on a per-gate `oneshot` channel — this is just I/O, no different from awaiting a web request. The Runner has no gate-specific logic; it processes one JoinSet completion per iteration and loops. Other gaps keep executing concurrently while the human acts. The CLI subscribes to the `SignalBus` and surfaces Gate prompts in real-time. The user runs `approve <name>` or `reject <name>`, which sends on the gate's `oneshot`. On approval, the gap task resumes execution. On rejection, the Gap posts Failure evidence and transitions to Closed.
-
-**Rationale:** `Gated` is a first-class state for **observability** (HUD, planner view, CLI display). The Runner doesn't check for it — it just sees async tasks on the JoinSet. Human latency doesn't block unrelated gaps because the JoinSet processes completions incrementally (one at a time), not in batch. The terminal condition is simply `all_closed()` — `all_gated_or_closed()` is removed.
-
-**Trade-offs:** A Gated Gap blocks all downstream Gaps that depend on it, since they cannot promote from Blocked until their dependency is Closed. This is correct — downstream tasks that depend on a human-gated action cannot proceed until that action is confirmed. Independent branches are unaffected.
-
-### ADR-006: Living Blackboard with Mutable Intent and Growable DAG
-
-**Status:** Accepted — supersedes the "round-scoped immutable Blackboard" design from v0.4.
-
-**Context:** The original design created a fresh Blackboard for every user message and sealed it immediately after synthesis. Follow-ups required reconstructing context from M1 summaries or M3 Crystals — a lossy process that threw away the rich Evidence the system just produced. The sealed-per-round model also introduced an artificial lifecycle boundary that didn't match how users actually interact: a follow-up like "make it business class" after "book a flight" is clearly the same conversation thread, not a new one.
-
-**Decision:** A Blackboard is a living workspace. It stays open across follow-up messages. On each user input, the Orchestrator receives the full Blackboard state (intent + Gaps + Evidence summaries), returns an updated intent and new Gaps. New Gaps are appended — the Gap array only grows. The intent is mutable and evolves to reflect the user's expanding scope. The Blackboard is sealed only when the Orchestrator's decompose output signals a new, unrelated topic, or when the session ends.
-
-**Rationale:**
-- Follow-ups get full-fidelity access to prior Evidence — no information loss from summarization or crystallization.
-- The Runner and DAG scheduler require zero changes: `drain_ready()` skips Closed Gaps, `promote_unblocked()` handles dependencies on already-Closed Gaps naturally, `insert_gap()` works on a board with existing Closed Gaps.
-- New-topic detection is absorbed into the decompose call — no separate classifier, no extra LLM call, no explicit mode flag. `Decomposition::is_follow_up` carries the decision.
-- The Orchestrator already receives the Blackboard state for planning. Asking it to also refine the intent and decide topic continuity adds zero cost.
-
-**Trade-offs:**
-- A long-running Blackboard accumulates many Gaps and Evidence records. The `snapshot()` serialization sent to the Orchestrator could grow large. Mitigation: summarize Evidence in the planner view rather than including raw content; cap the number of Gap entries shown to the LLM.
-- Crystallization timing changes: Crystals are now produced less frequently (on topic change rather than every message). Each Crystal covers more ground, which may be better or worse for M3 retrieval precision. This is an open question to evaluate once M3 is implemented.
-- The "new-topic" inference heuristic (no new Gaps reference existing ones + intent diverges) may have edge cases. If it proves unreliable, a fallback is an explicit user command (`/new`) to force a board seal.
+| ADR | Title | Status |
+|-----|-------|--------|
+| [001](docs/ADR-001-blackboard-pattern.md) | Blackboard pattern over message-passing agents | Accepted |
+| [002](docs/ADR-002-rust.md) | Rust as implementation language | Accepted |
+| [003](docs/ADR-003-code-as-solver.md) | LLM-generated code as the execution primitive | Accepted |
+| [004](docs/ADR-004-flat-agent-loops.md) | Flat agent loops, not recursive Orchestrators | Superseded by 009 |
+| [005](docs/ADR-005-hitl-gated.md) | Human-in-the-loop via `GapState::Gated` | Accepted (updated by 007) |
+| [006](docs/ADR-006-living-blackboard.md) | Living Blackboard with mutable intent and growable DAG | Accepted |
+| [007](docs/ADR-007-defenseclaw-and-hitl-gating.md) | DefenseClaw and HITL gating | Accepted |
+| [008](docs/ADR-008-broadcast-foundation.md) | Broadcast foundation | Accepted |
+| [009](docs/ADR-009-unified-solver.md) | Unified Solver — eliminating the Compiler/Executor split | Accepted |
 
 ---
 
-## 14. Open Questions
+## 13. Open Questions
 
-These are unresolved design decisions that need answers before or during implementation.
+These are unresolved design decisions.
 
-1. ~~**Re-planning.**~~ **Closed — Decision:** No re-planning in v1. Terminal failure propagates through the DAG downstream. Dependent Gaps are marked Closed with `EvidenceStatus::Failure`. Re-planning is deferred to v2 and requires explicit plan versioning and a `replace_subgraph` API on the Blackboard.
+1. **Streaming vs. batch Evidence.** Should the Solver post Evidence incrementally (streaming) or only after completion (batch)? Streaming enables HUD progress but complicates "done" semantics on Evidence.
 
-2. **Streaming vs. batch Evidence.** Should the Executor post Evidence incrementally as a script produces output (streaming), or only after the script completes (batch)? Streaming enables the HUD to show progress, but complicates the "done" semantics on Evidence and the dependency resolution logic.
+2. **Embedding model for M3.** Local model (e.g., `nomic-embed-text` on GPU) vs. remote API (e.g., OpenAI embeddings via OpenRouter). Local keeps it offline; remote is simpler.
 
-3. **Embedding model for M3.** Which embedding model for Knowledge Crystal vectors? Options: a local model (e.g., `nomic-embed-text` on the RTX 4090), or a remote API (e.g., OpenAI embeddings via OpenRouter). Local keeps it offline; remote is simpler to start with.
-
-4. **Multi-user / multi-session.** The current design is single-user, single-session. If Moss ever serves multiple concurrent sessions (e.g., as a daemon handling multiple terminal windows), the Blackboard needs session-scoped namespacing and the Memory tiers need per-user isolation.
-
-5. ~~**Micro-Agent recursion depth.**~~ **Closed — Decision:** Micro-Agents are flat ReAct loops. They do not instantiate a new Orchestrator, do not have a sub-Blackboard, and do not call the Compiler. Recursion depth is 0. Not applicable.
+3. **Multi-user / multi-session.** Current design is single-user, single-session. Multiple concurrent sessions would require session-scoped namespacing and per-user Memory isolation.
 
 ---
 
-## 15. Implementation Status Matrix
+## 14. Implementation Status Matrix
 
 | Component | Layer | Status | Notes |
 |---|---|---|---|
@@ -996,9 +730,10 @@ These are unresolved design decisions that need answers before or during impleme
 | Blackboard insert/mutate | L3 | `IMPLEMENTED` | `insert_gap`, `set_gap_state`, `append_evidence`, `set_intent`, `register_approval`, `approve` |
 | Blackboard dependency resolution | L3 | `IMPLEMENTED` | `promote_unblocked`, `drain_ready`, `all_closed` — unit tested. `all_gated_or_closed` removed (ADR-007). |
 | Signal Bus integration | L3 | `IMPLEMENTED` | Every mutation emits `Event::Snapshot`. `register_approval`/`approve` for HITL oneshot. `signal_tx()` for external emission. |
-| Compiler | L2 | `IMPLEMENTED` | `compiler.rs` — `Artifact` (Script/Agent), prior_attempts error strings, tested with LocalMock |
-| Executor (script) | L2 | `IMPLEMENTED` | `executor.rs` — subprocess runner, timeout, Evidence to Blackboard |
-| Executor (Micro-Agent) | L2 | `PLANNED` | Stub in `executor.rs` — writes Failure evidence. Phase 8. |
+| Solver (unified loop + step parser) | L2 | `PLANNED` | `solver.rs` — replaces Compiler + Executor (ADR-009) |
+| Solver prompt | L2 | `PLANNED` | `prompts/solver.md` — fixed frame, working memory, last output |
+| ~~Compiler~~ | L2 | `DELETED` | Removed by ADR-009; `compiler.rs` and `prompts/compiler.md` to be deleted |
+| ~~Executor~~ | L2 | `DELETED` | Removed by ADR-009; `executor.rs` to be deleted |
 | M1 session context | L1 | `PLANNED — design open` | Cross-board awareness; structure TBD |
 | M2 Sled store | L1 | `PLANNED` | `sled` not in Cargo.toml |
 | M3 Qdrant integration | L1 | `PLANNED` | `qdrant-client` not in Cargo.toml |
@@ -1019,7 +754,7 @@ These are unresolved design decisions that need answers before or during impleme
 5. ~~**Executor (script path).**~~ ✅ Done — subprocess runner with timeout, Evidence written to Blackboard.
 6. ~~**Signal Bus + Runner rewrite + CLI async loop (ADR-008).**~~ ✅ Done — `signal.rs` broadcast, `drive_gaps` on Orchestrator, `Cli` with `tokio::select!`.
 7. ~~**DefenseClaw.**~~ ✅ Done — `ArtifactGuard`: 4-stage scan, HITL oneshot round-trip, `ApprovalRequested` signal.
-8. **MCP bridge + Agent Loop.** Connect to at least one MCP server (filesystem). Implement `MicroAgent` ReAct loop for Reactive Gaps. MicroAgent can use `register_approval()` for human input mid-loop.
+8. **Solver (Phase 8).** Delete `compiler.rs`, `executor.rs`, `prompts/compiler.md`, `Artifact` enum. Write `solver.rs` (struct, bounded loop, `Code`/`Ask`/`Done` step parser, scratch extraction) and `prompts/solver.md` (fixed frame). Update Orchestrator to call `solver.run(&gap)`. Migrate Compiler tests to Solver tests (mock provider returning each step variant).
 9. **Memory (M1).** Session context layer. Enables cross-board awareness after topic changes.
 10. **Memory (M2/M3).** Sled + Qdrant. Enables cross-session learning.
 11. **HUD.** Subscribes to `SignalBus` from phase 6. Renders `Signal` events as terminal deltas. No new infrastructure — just another consumer.

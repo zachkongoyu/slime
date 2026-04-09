@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use minijinja::{Environment, context};
-use tokio::sync::{broadcast, oneshot};
+use tokio::sync::broadcast;
 use tokio::task::JoinSet;
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -9,30 +9,69 @@ use uuid::Uuid;
 use crate::error::MossError;
 use crate::providers::{Message, Role, Provider};
 
-use super::artifact_guard::{ArtifactGuard, ScanVerdict};
-use super::blackboard::{Blackboard, Evidence, EvidenceStatus, Gap, GapState};
-use super::compiler::Compiler;
+use super::artifact_guard::ArtifactGuard;
+use super::blackboard::{Blackboard, EvidenceStatus, Gap, GapState};
 use super::decomposition::Decomposition;
-use super::executor::Executor;
 use super::signal::{self, Event};
-
-/// After this many failed attempts a Gap is force-closed to prevent infinite loops.
-const MAX_RETRIES: u32 = 3;
+use super::solver::Solver;
 
 pub(crate) struct Orchestrator {
     provider: Arc<dyn Provider>,
-    compiler: Arc<Compiler>,
     guard: Arc<ArtifactGuard>,
+    environment: String,
     blackboard: Mutex<Arc<Blackboard>>,
     tx: broadcast::Sender<signal::Payload>,
 }
 
+/// Probe the local system for available runtimes and report OS info.
+/// Called once at startup; result is passed into `Solver::new()`.
+fn detect_environment() -> String {
+    let os = std::env::consts::OS;
+    let arch = std::env::consts::ARCH;
+
+    let runtimes: Vec<(&str, &str)> = vec![
+        ("python3", "python3 --version"),
+        ("node",    "node --version"),
+        ("sh",      "sh --version"),
+    ];
+
+    let mut lines = vec![format!("**OS:** {os} ({arch})")];
+
+    let mut available = Vec::new();
+    for (name, cmd) in &runtimes {
+        let parts: Vec<&str> = cmd.split_whitespace().collect();
+        if let Ok(output) = std::process::Command::new(parts[0])
+            .args(&parts[1..])
+            .output()
+        {
+            if output.status.success() {
+                let version = String::from_utf8_lossy(&output.stdout)
+                    .trim()
+                    .to_string();
+                available.push(format!("{name} ({version})"));
+            } else {
+                available.push(name.to_string());
+            }
+        }
+    }
+
+    if available.is_empty() {
+        lines.push("**Runtimes:** none detected".into());
+    } else {
+        lines.push(format!("**Runtimes:** {}", available.join(", ")));
+    }
+
+    lines.join("\n")
+}
+
 impl Orchestrator {
     pub(crate) fn new(provider: Arc<dyn Provider>, tx: broadcast::Sender<signal::Payload>) -> Self {
+        let guard = Arc::new(ArtifactGuard::new());
+        let environment = detect_environment();
         Self {
-            compiler: Arc::new(Compiler::new(Arc::clone(&provider))),
-            guard: Arc::new(ArtifactGuard::new()),
             provider,
+            guard,
+            environment,
             blackboard: Mutex::new(Arc::new(Blackboard::new(tx.clone()))),
             tx,
         }
@@ -40,6 +79,10 @@ impl Orchestrator {
 
     pub(crate) fn approve(&self, gap_id: Uuid, approved: bool) {
         self.blackboard.lock().unwrap().approve(gap_id, approved);
+    }
+
+    pub(crate) fn answer(&self, gap_id: Uuid, answer: String) {
+        self.blackboard.lock().unwrap().answer_question(gap_id, answer);
     }
 
     /// Run a single user query end-to-end.
@@ -66,7 +109,6 @@ impl Orchestrator {
             let gap = Gap::new(
                 spec.name,
                 spec.description,
-                spec.gap_type,
                 spec.dependencies.into_iter().map(|s| s.into_boxed_str()).collect(),
                 spec.constraints,
                 spec.expected_output.map(|s| s.into_boxed_str()),
@@ -79,7 +121,7 @@ impl Orchestrator {
         self.synthesize(&board).await
     }
 
-    /// Drive the Gap DAG to completion: dispatch ready gaps, await one result per tick.
+    /// Drive the Gap DAG to completion: dispatch ready gaps to the Solver.
     async fn drive_gaps(&self, blackboard: Arc<Blackboard>) -> Result<(), MossError> {
         let mut tasks: JoinSet<Result<(), MossError>> = JoinSet::new();
 
@@ -87,73 +129,17 @@ impl Orchestrator {
             blackboard.promote_unblocked();
 
             for gap in blackboard.drain_ready() {
-                let compiler = Arc::clone(&self.compiler);
-                let guard = Arc::clone(&self.guard);
+                let solver = Solver::new(
+                    Arc::clone(&self.provider),
+                    Arc::clone(&self.guard),
+                    self.environment.clone(),
+                );
                 let bb = Arc::clone(&blackboard);
 
                 info!(gap = %gap.name(), "dispatched");
 
                 tasks.spawn(async move {
-                    let evs = bb.get_evidence(&gap.gap_id());
-                    let attempt_count = evs.len() as u32;
-
-                    let prior: Vec<Box<str>> = evs
-                        .iter()
-                        .filter_map(|ev| match ev.status() {
-                            EvidenceStatus::Failure { reason } => Some(reason.as_str().into()),
-                            _ => None,
-                        })
-                        .collect();
-
-                    if attempt_count >= MAX_RETRIES {
-                        warn!(gap = %gap.name(), "max retries reached — force closing");
-                        return bb.set_gap_state(&gap.gap_id(), GapState::Closed);
-                    }
-
-                    let artifact = compiler.compile(&gap, &prior).await?;
-
-                    match guard.scan(&artifact, gap.constraints()) {
-                        ScanVerdict::Approved => {}
-                        ScanVerdict::Rejected { reason } => {
-                            warn!(gap = %gap.name(), %reason, "rejected by guard");
-                            let attempt = bb.get_evidence(&gap.gap_id()).len() as u32 + 1;
-                            bb.append_evidence(Evidence::new(
-                                gap.gap_id(),
-                                attempt,
-                                serde_json::json!({ "guard": "rejected", "reason": reason.as_ref() }),
-                                EvidenceStatus::Failure { reason: reason.into() },
-                            ));
-                            return bb.set_gap_state(&gap.gap_id(), GapState::Closed);
-                        }
-                        ScanVerdict::Gated { reason } => {
-                            bb.set_gap_state(&gap.gap_id(), GapState::Gated)?;
-
-                            let (request, approval) = oneshot::channel();
-                            bb.register_approval(gap.gap_id(), request);
-                            let _ = bb.signal_tx().send(Event::ApprovalRequested {
-                                gap_id: gap.gap_id(),
-                                gap_name: gap.name().into(),
-                                reason: reason.clone(),
-                            });
-
-                            let approved = approval.await.unwrap_or(false);
-                            if !approved {
-                                warn!(gap = %gap.name(), "guard denied by user");
-                                let attempt = bb.get_evidence(&gap.gap_id()).len() as u32 + 1;
-                                bb.append_evidence(Evidence::new(
-                                    gap.gap_id(),
-                                    attempt,
-                                    serde_json::json!({ "guard": "denied", "reason": reason.as_ref() }),
-                                    EvidenceStatus::Failure { reason: reason.into() },
-                                ));
-                                return bb.set_gap_state(&gap.gap_id(), GapState::Closed);
-                            }
-
-                            bb.set_gap_state(&gap.gap_id(), GapState::Assigned)?;
-                        }
-                    }
-
-                    Executor::new().run(&gap, &artifact, &bb).await?;
+                    solver.run(&gap, &bb).await?;
 
                     let last_success = bb
                         .get_evidence(&gap.gap_id())
@@ -163,11 +149,10 @@ impl Orchestrator {
 
                     if last_success {
                         info!(gap = %gap.name(), "closed (success)");
-                        bb.set_gap_state(&gap.gap_id(), GapState::Closed)
                     } else {
-                        warn!(gap = %gap.name(), "execution failed — will retry");
-                        bb.set_gap_state(&gap.gap_id(), GapState::Ready)
+                        warn!(gap = %gap.name(), "solver failed — closing");
                     }
+                    bb.set_gap_state(&gap.gap_id(), GapState::Closed)
                 });
             }
 
@@ -259,12 +244,12 @@ impl Orchestrator {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+    use std::sync::Arc;
 
     use async_trait::async_trait;
 
     use crate::error::ProviderError;
-    use crate::moss::blackboard::{Blackboard, Gap, GapState, GapType};
+    use crate::moss::blackboard::{Blackboard, Gap, GapState};
     use crate::moss::signal;
     use crate::providers::{Message, Provider};
 
@@ -277,33 +262,13 @@ mod tests {
         Orchestrator::new(Arc::new(provider), tx)
     }
 
+    /// Returns a done JSON — the Solver parses it and posts success evidence.
     struct AlwaysSucceedProvider;
 
     #[async_trait]
     impl Provider for AlwaysSucceedProvider {
         async fn complete_chat(&self, _: Vec<Message>) -> Result<String, ProviderError> {
-            Ok(r#"{"type":"SCRIPT","language":"shell","code":"echo '{\"result\":\"ok\"}'","timeout_secs":10}"#.into())
-        }
-    }
-
-    /// Fails on the first call, succeeds on all subsequent calls.
-    struct FailOnceThenSucceedProvider {
-        calls: Arc<AtomicUsize>,
-    }
-
-    impl FailOnceThenSucceedProvider {
-        fn new() -> Self { Self { calls: Arc::new(AtomicUsize::new(0)) } }
-    }
-
-    #[async_trait]
-    impl Provider for FailOnceThenSucceedProvider {
-        async fn complete_chat(&self, _: Vec<Message>) -> Result<String, ProviderError> {
-            let n = self.calls.fetch_add(1, Ordering::SeqCst);
-            if n == 0 {
-                Ok(r#"{"type":"SCRIPT","language":"shell","code":"exit 1","timeout_secs":10}"#.into())
-            } else {
-                Ok(r#"{"type":"SCRIPT","language":"shell","code":"echo '{\"result\":\"ok\"}'","timeout_secs":10}"#.into())
-            }
+            Ok(r#"{"step":"done","value":{"result":"ok"}}"#.into())
         }
     }
 
@@ -311,7 +276,6 @@ mod tests {
         Gap::new(
             name,
             "test gap",
-            GapType::Proactive,
             deps.into_iter().map(|s| s.into()).collect(),
             None,
             None,
@@ -339,17 +303,6 @@ mod tests {
         let b_id = bb.get_gap_id_by_name("B").unwrap();
         assert_eq!(bb.get_gap(&a_id).unwrap().state(), &GapState::Closed);
         assert_eq!(bb.get_gap(&b_id).unwrap().state(), &GapState::Closed);
-    }
-
-    #[tokio::test]
-    async fn gap_retries_after_failure() {
-        let o = orchestrator(FailOnceThenSucceedProvider::new());
-        let bb = bb();
-        bb.insert_gap(gap("retry_gap", vec![])).unwrap();
-        o.drive_gaps(Arc::clone(&bb)).await.unwrap();
-        let id = bb.get_gap_id_by_name("retry_gap").unwrap();
-        assert_eq!(bb.get_gap(&id).unwrap().state(), &GapState::Closed);
-        assert_eq!(bb.get_evidence(&id).len(), 2);
     }
 
     #[tokio::test]

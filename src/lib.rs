@@ -35,6 +35,10 @@ impl Moss {
         self.orchestrator.approve(gap_id, approved);
     }
 
+    pub fn answer(&self, gap_id: Uuid, answer: String) {
+        self.orchestrator.answer(gap_id, answer);
+    }
+
     pub async fn run(&self, query: &str) -> Result<String, MossError> {
         self.orchestrator.run(query).await
     }

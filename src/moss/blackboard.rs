@@ -18,14 +18,7 @@ pub(crate) enum GapState {
     Blocked,
     Ready,
     Assigned,
-    Gated,
     Closed,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub(crate) enum GapType {
-    Proactive,
-    Reactive,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,7 +27,6 @@ pub(crate) struct Gap {
     name: Box<str>,
     state: GapState,
     description: Box<str>,
-    gap_type: GapType,
     dependencies: Vec<Box<str>>,
     constraints: Option<Value>,
     expected_output: Option<Box<str>>,
@@ -44,7 +36,6 @@ impl Gap {
     pub(crate) fn new(
         name: impl Into<Box<str>>,
         description: impl Into<Box<str>>,
-        gap_type: GapType,
         dependencies: Vec<Box<str>>,
         constraints: Option<Value>,
         expected_output: Option<Box<str>>,
@@ -56,7 +47,6 @@ impl Gap {
             name: name.into(),
             state: if has_deps { GapState::Blocked } else { GapState::Ready },
             description: description.into(),
-            gap_type,
             dependencies: deps,
             constraints,
             expected_output,
@@ -67,7 +57,6 @@ impl Gap {
     pub(crate) fn name(&self) -> &str { &self.name }
     pub(crate) fn state(&self) -> &GapState { &self.state }
     pub(crate) fn description(&self) -> &str { &self.description }
-    pub(crate) fn gap_type(&self) -> &GapType { &self.gap_type }
     pub(crate) fn dependencies(&self) -> &[Box<str>] { &self.dependencies }
     pub(crate) fn constraints(&self) -> Option<&Value> { self.constraints.as_ref() }
     pub(crate) fn expected_output(&self) -> Option<&str> { self.expected_output.as_deref() }
@@ -80,24 +69,21 @@ impl Gap {
 pub(crate) enum EvidenceStatus {
     Success,
     Failure { reason: String },
-    Partial,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Evidence {
     gap_id: Uuid,
-    attempt: u32,
     content: Value,
     status: EvidenceStatus,
 }
 
 impl Evidence {
-    pub(crate) fn new(gap_id: Uuid, attempt: u32, content: Value, status: EvidenceStatus) -> Self {
-        Self { gap_id, attempt, content, status }
+    pub(crate) fn new(gap_id: Uuid, content: Value, status: EvidenceStatus) -> Self {
+        Self { gap_id, content, status }
     }
 
     pub(crate) fn gap_id(&self) -> Uuid { self.gap_id }
-    pub(crate) fn attempt(&self) -> u32 { self.attempt }
     pub(crate) fn content(&self) -> &Value { &self.content }
     pub(crate) fn status(&self) -> &EvidenceStatus { &self.status }
 }
@@ -111,6 +97,7 @@ pub(crate) struct Blackboard {
     name_index: DashMap<Box<str>, Uuid>,
     evidences: DashMap<Uuid, Vec<Evidence>>,
     pending_approvals: DashMap<Uuid, oneshot::Sender<bool>>,
+    pending_questions: DashMap<Uuid, oneshot::Sender<String>>,
     tx: broadcast::Sender<signal::Payload>,
 }
 
@@ -129,6 +116,7 @@ impl Blackboard {
             name_index: DashMap::new(),
             evidences: DashMap::new(),
             pending_approvals: DashMap::new(),
+            pending_questions: DashMap::new(),
             tx,
         }
     }
@@ -247,6 +235,16 @@ impl Blackboard {
         }
     }
 
+    pub(crate) fn register_question(&self, gap_id: Uuid, sender: oneshot::Sender<String>) {
+        self.pending_questions.insert(gap_id, sender);
+    }
+
+    pub(crate) fn answer_question(&self, gap_id: Uuid, answer: String) {
+        if let Some((_, sender)) = self.pending_questions.remove(&gap_id) {
+            let _ = sender.send(answer);
+        }
+    }
+
     pub(crate) fn all_evidence(&self) -> Vec<Evidence> {
         self.evidences
             .iter()
@@ -282,7 +280,6 @@ mod tests {
         Gap::new(
             name,
             format!("description for {name}"),
-            GapType::Proactive,
             deps.into_iter().map(|s| s.into()).collect(),
             None,
             None,
@@ -354,12 +351,10 @@ mod tests {
         let bb = bb();
         let gap_id = Uuid::new_v4();
 
-        bb.append_evidence(Evidence::new(gap_id, 1, json!({"result": 42}), EvidenceStatus::Success));
-        bb.append_evidence(Evidence::new(gap_id, 2, json!({"result": 99}), EvidenceStatus::Partial));
+        bb.append_evidence(Evidence::new(gap_id, json!({"result": 42}), EvidenceStatus::Success));
+        bb.append_evidence(Evidence::new(gap_id, json!({"result": 99}), EvidenceStatus::Success));
 
         let evs = bb.get_evidence(&gap_id);
         assert_eq!(evs.len(), 2);
-        assert_eq!(evs[0].attempt(), 1);
-        assert_eq!(evs[1].attempt(), 2);
     }
 }

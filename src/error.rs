@@ -20,13 +20,10 @@ pub enum MossError {
     #[error("provider error: {0}")]
     Provider(#[from] ProviderError),
 
-    #[error("compiler error for gap {gap_id}: {reason}")]
-    Compiler { gap_id: Uuid, reason: String },
+    #[error("solver error for gap {gap_id}: {reason}")]
+    Solver { gap_id: Uuid, reason: String },
 
-    #[error("executor error for gap {gap_id}: {reason}")]
-    Executor { gap_id: Uuid, reason: String },
-
-    #[error("defense scan rejected artifact: {reason}")]
+    #[error("defense scan rejected code: {reason}")]
     DefenseRejection { reason: String },
 
     #[error("blackboard error: {0}")]
@@ -37,9 +34,6 @@ pub enum MossError {
 
     #[error("session expired")]
     SessionExpired,
-
-    #[error("MCP tool error: {tool} — {reason}")]
-    Mcp { tool: String, reason: String },
 
     #[error(transparent)]
     Io(#[from] std::io::Error),
