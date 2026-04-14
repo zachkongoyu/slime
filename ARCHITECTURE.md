@@ -703,6 +703,7 @@ All ADRs live in `docs/ADR-*.md`. Key decisions:
 | [007](docs/ADR-007-defenseclaw-and-hitl-gating.md) | DefenseClaw and HITL gating | Accepted |
 | [008](docs/ADR-008-broadcast-foundation.md) | Broadcast foundation | Accepted |
 | [009](docs/ADR-009-unified-solver.md) | Unified Solver — eliminating the Compiler/Executor split | Accepted |
+| [010](docs/ADR-010-solver-state-observability.md) | Solver state observability via Blackboard | Proposed |
 
 ---
 
