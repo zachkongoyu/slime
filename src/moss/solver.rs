@@ -6,7 +6,7 @@ use minijinja::{Environment, context};
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::process::Command;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
@@ -14,8 +14,9 @@ use crate::error::MossError;
 use crate::providers::{Message, Role, Provider};
 
 use super::artifact_guard::{ArtifactGuard, ScanVerdict};
-use super::blackboard::{Blackboard, Evidence, EvidenceStatus, Gap};
-use super::signal::Event;
+use super::blackboard::Blackboard;
+use super::types::{Evidence, EvidenceStatus, Gap};
+use super::signal::{self, Event};
 
 /// Maximum iterations before the Solver force-stops a gap.
 const MAX_ITERATIONS: u32 = 10;
@@ -34,6 +35,16 @@ enum Step {
     Done { value: Value },
 }
 
+impl Step {
+    fn label(&self) -> Box<str> {
+        match self {
+            Step::Code { interpreter, .. } => format!("code: {interpreter}").into(),
+            Step::Ask  { .. }              => "ask".into(),
+            Step::Done { .. }              => "done".into(),
+        }
+    }
+}
+
 /// Wrapper that includes the optional scratch field.
 #[derive(Debug, Deserialize)]
 struct SolverResponse {
@@ -48,23 +59,48 @@ pub(crate) struct Solver {
     provider: Arc<dyn Provider>,
     guard: Arc<ArtifactGuard>,
     environment: String,
+    tx: mpsc::Sender<signal::Event>,
 }
 
 impl Solver {
-    pub(crate) fn new(provider: Arc<dyn Provider>, guard: Arc<ArtifactGuard>, environment: String) -> Self {
-        Self { provider, guard, environment }
+    pub(crate) fn new(
+        provider: Arc<dyn Provider>,
+        guard: Arc<ArtifactGuard>,
+        environment: String,
+        tx: mpsc::Sender<signal::Event>,
+    ) -> Self {
+        Self { provider, guard, environment, tx }
     }
 
-    /// Run the unified solver loop for a single Gap.
-    ///
-    /// The loop renders the prompt, calls the LLM, parses the response into a
-    /// Step, and acts accordingly.  Iterates until the LLM emits a `Done` step
-    /// or `MAX_ITERATIONS` is reached.
+    fn emit_progress(
+        &self,
+        gap: &Gap,
+        iteration: u32,
+        step: Box<str>,
+        last_result: Option<Box<str>>,
+    ) {
+        let _ = self.tx.try_send(Event::SolverProgress {
+            gap_id:         gap.gap_id(),
+            gap_name:       gap.name().into(),
+            iteration,
+            max_iterations: MAX_ITERATIONS,
+            step,
+            last_result,
+        });
+    }
+
     pub(crate) async fn run(&self, gap: &Gap, blackboard: &Blackboard) -> Result<(), MossError> {
         let mut working_memory = String::new();
         let mut last_output: Option<String> = None;
 
         for iteration in 0..MAX_ITERATIONS {
+            self.emit_progress(
+                gap, 
+                iteration, 
+                "prompting".into(), 
+                last_output.as_deref().map(Box::from)
+            );
+
             let related_evidence = self.gather_related_evidence(gap, blackboard);
 
             let prompt = self.render_prompt(
@@ -97,23 +133,28 @@ impl Solver {
                 working_memory.push_str(scratch);
             }
 
+            let step_label = parsed.step.label();
             match parsed.step {
                 Step::Code { interpreter, ext, code } => {
+                    self.emit_progress(gap, iteration, step_label.clone(), None);
+
                     match self.guard.scan_code(&code) {
                         ScanVerdict::Approved => {}
                         ScanVerdict::Rejected { reason } => {
                             warn!(gap = %gap.name(), %reason, "rejected by guard");
+                            let result: Box<str> = format!("guard rejected: {reason}").into();
+                            self.emit_progress(gap, iteration, step_label.clone(), Some(result.clone()));
                             last_output = Some(format!("ERROR: code rejected by guard: {reason}"));
                             continue;
                         }
                         ScanVerdict::Gated { reason } => {
-                            let (tx, rx) = oneshot::channel();
-                            blackboard.register_approval(gap.gap_id(), tx);
-                            let _ = blackboard.signal_tx().send(Event::ApprovalRequested {
-                                gap_id: gap.gap_id(),
+                            let (otx, rx) = oneshot::channel();
+                            let _ = self.tx.send(Event::Approval {
+                                gap_id:   gap.gap_id(),
                                 gap_name: gap.name().into(),
-                                reason: reason.clone(),
-                            });
+                                reason:   reason.clone(),
+                                tx:       otx,
+                            }).await;
 
                             let approved = rx.await.unwrap_or(false);
                             if !approved {
@@ -124,42 +165,52 @@ impl Solver {
                         }
                     }
 
-                    match self.execute_code(&interpreter, &ext, &code).await {
+                    let exec_result = match self.execute_code(&interpreter, &ext, &code).await {
                         Ok(stdout) => {
-                            last_output = Some(stdout);
+                            last_output = Some(stdout.clone());
+                            let summary = if stdout.starts_with("EXIT CODE:") { "exit 1" }
+                                          else if stdout.starts_with("ERROR:") { "error" }
+                                          else { "exit 0" };
+                            summary.into()
                         }
                         Err(e) => {
                             last_output = Some(format!("ERROR: execution error: {e}"));
+                            Box::from("error")
                         }
-                    }
+                    };
+                    self.emit_progress(gap, iteration, step_label, Some(exec_result));
                 }
 
                 Step::Ask { question } => {
-                    let (tx, rx) = oneshot::channel();
-                    blackboard.register_question(gap.gap_id(), tx);
-                    let _ = blackboard.signal_tx().send(Event::QuestionAsked {
-                        gap_id: gap.gap_id(),
+                    self.emit_progress(gap, iteration, step_label, None);
+                    let (otx, rx) = oneshot::channel();
+                    let _ = self.tx.send(Event::Question {
+                        gap_id:   gap.gap_id(),
                         gap_name: gap.name().into(),
                         question: question.into(),
-                    });
+                        tx:       otx,
+                    }).await;
 
                     let answer = rx.await.unwrap_or_else(|_| "(no answer received)".into());
+                    self.emit_progress(gap, iteration, "prompting".into(), Some("answered".into()));
                     last_output = Some(format!("Human answered: {answer}"));
                 }
 
                 Step::Done { value } => {
+                    self.emit_progress(gap, iteration, step_label, Some("done".into()));
                     blackboard.append_evidence(Evidence::new(
                         gap.gap_id(),
                         value,
                         EvidenceStatus::Success,
                     ));
-                    info!(gap = %gap.name(), "closed (done)");
+                    // info!(gap = %gap.name(), "closed (done)");
                     return Ok(());
                 }
             }
         }
 
         // Exhausted all iterations — post failure evidence.
+        self.emit_progress(gap, MAX_ITERATIONS - 1, "done".into(), Some("exhausted".into()));
         blackboard.append_evidence(Evidence::new(
             gap.gap_id(),
             Value::Null,
@@ -289,14 +340,13 @@ fn parse_response(response: &str) -> Result<SolverResponse, serde_json::Error> {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use async_trait::async_trait;
     use serde_json::json;
 
     use crate::error::ProviderError;
-    use crate::moss::blackboard::{Blackboard, EvidenceStatus, Gap};
-    use crate::moss::signal;
+    use crate::moss::blackboard::Blackboard;
+    use crate::moss::types::{EvidenceStatus, Gap};
     use crate::providers::{Message, Provider};
 
     use super::*;
@@ -389,11 +439,16 @@ mod tests {
     // ── Solver integration tests ─────────────────────────────────────────────
 
     fn bb() -> Blackboard {
-        Blackboard::new(signal::channel(1).0)
+        Blackboard::new(mpsc::channel(16).0)
     }
 
     fn make_gap(name: &str) -> Gap {
         Gap::new(name, "Test description", vec![], None, None)
+    }
+
+    fn solver(provider: impl Provider + 'static) -> Solver {
+        let (tx, _) = mpsc::channel(16);
+        Solver::new(Arc::new(provider), Arc::new(ArtifactGuard::new()), "test".into(), tx)
     }
 
     struct DoneProvider;
@@ -405,36 +460,13 @@ mod tests {
         }
     }
 
-    struct FailThenDoneProvider {
-        calls: AtomicUsize,
-    }
-
-    impl FailThenDoneProvider {
-        fn new() -> Self {
-            Self { calls: AtomicUsize::new(0) }
-        }
-    }
-
-    #[async_trait]
-    impl Provider for FailThenDoneProvider {
-        async fn complete_chat(&self, _: Vec<Message>) -> Result<String, ProviderError> {
-            let n = self.calls.fetch_add(1, Ordering::SeqCst);
-            if n == 0 {
-                Ok(r#"{"step":"code","interpreter":"sh","ext":".sh","code":"exit 1\n"}"#.into())
-            } else {
-                Ok(r#"{"step":"done","value":{"result":"recovered"}}"#.into())
-            }
-        }
-    }
-
     #[tokio::test]
     async fn solver_done_posts_success_evidence() {
         let bb = bb();
         let gap = make_gap("simple_gap");
         bb.insert_gap(gap.clone()).unwrap();
 
-        let guard = Arc::new(ArtifactGuard::new());
-        let solver = Solver::new(Arc::new(DoneProvider), guard, "test".into());
+        let solver = solver(DoneProvider);
         solver.run(&gap, &bb).await.unwrap();
 
         let evs = bb.get_evidence(&gap.gap_id());
@@ -459,8 +491,7 @@ mod tests {
         let gap = make_gap("hard_gap");
         bb.insert_gap(gap.clone()).unwrap();
 
-        let guard = Arc::new(ArtifactGuard::new());
-        let solver = Solver::new(Arc::new(ExhaustedProvider), guard, "test".into());
+        let solver = solver(ExhaustedProvider);
         solver.run(&gap, &bb).await.unwrap();
 
         let evs = bb.get_evidence(&gap.gap_id());
@@ -470,8 +501,26 @@ mod tests {
     }
 
     #[test]
+    fn step_label_code() {
+        let step = Step::Code { interpreter: "python3".into(), ext: ".py".into(), code: String::new() };
+        assert_eq!(&*step.label(), "code: python3");
+    }
+
+    #[test]
+    fn step_label_ask() {
+        let step = Step::Ask { question: "what?".into() };
+        assert_eq!(&*step.label(), "ask");
+    }
+
+    #[test]
+    fn step_label_done() {
+        let step = Step::Done { value: serde_json::Value::Null };
+        assert_eq!(&*step.label(), "done");
+    }
+
+    #[test]
     fn guard_rejection_surfaces_as_error() {
-        let response = r#"{"step":"code","interpreter":"python3","ext":".py","code":"import os\nos.listdir('.')\n"}"#;
+        let response = r#"{"step":"code","interpreter":"python3","ext":".py","code":"import subprocess\nsubprocess.run(['ls'])\n"}"#;
         let parsed = parse_response(response).unwrap();
         match &parsed.step {
             Step::Code { code, .. } => {

@@ -1,7 +1,7 @@
-# ADR-010 — Solver State Observability via Blackboard
+# ADR-010 — Solver State Observability via Event Bus
 
-**Status:** Proposed
-**Date:** 2026-04-14
+**Status:** Accepted
+**Date:** 2026-04-16
 
 ---
 
@@ -9,90 +9,83 @@
 
 Gaps in `Assigned` state are a black box. The Blackboard knows a solver is running but nothing about what it is doing — which iteration, what step, what the last result was. During a real run, the CLI shows "dispatched" and then silence for 10–30 seconds until "closed (done)".
 
-The existing event bus (`Event::Snapshot`) already carries full `BlackboardSnapshot` payloads on every Blackboard mutation. But `BlackboardSnapshot` contains only `intent`, `gaps`, and `evidences` — no solver-level state. Consumers (CLI today, frontend later) cannot render solver progress because the data does not exist in the snapshot.
+The existing event bus carries `Event::Snapshot` (full Blackboard state on every mutation), `Event::ApprovalRequested`, and `Event::QuestionAsked`. The Solver already sends `ApprovalRequested` and `QuestionAsked` directly via `blackboard.signal_tx().send(...)` — bypassing Blackboard storage entirely for ephemeral attention events.
 
-The Solver is ephemeral — constructed per-gap inside `tokio::spawn` in `drive_gaps`, dropped when it returns. No external code holds a reference to it.
+The Solver is ephemeral — constructed per-gap inside `tokio::spawn` in `drive_gaps`, dropped when it returns. Solver progress is equally ephemeral: once a gap closes, its solver state is meaningless. Storing it on the Blackboard would require explicit cleanup (`remove_solver_state`) and bloat the Blackboard's responsibility.
 
 ## Decision
 
-**Add a `SolverState` struct to the Blackboard. The Solver owns its state locally and pushes it to a `DashMap<Uuid, SolverState>` on the Blackboard at each state transition. Each push triggers a snapshot emission via the existing event bus.**
+**Add `Event::SolverProgress` to the signal bus. The Solver holds a cloned `broadcast::Sender` and fires progress events directly — no storage on the Blackboard, no cleanup responsibility.**
 
-### New types (in `blackboard.rs`)
+### Signal change (in `signal.rs`)
 
 ```rust
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub(crate) enum StepKind {
-    Prompting,
-    Executing { interpreter: Box<str> },
-    Waiting,
-    Finished,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct SolverState {
-    gap_id: Uuid,
-    iteration: u32,
-    max_iterations: u32,
-    step: StepKind,
-    last_result: Option<Box<str>>,
+pub enum Event {
+    Snapshot(Box<str>),
+    ApprovalRequested { gap_id: Uuid, gap_name: Box<str>, reason: Box<str> },
+    QuestionAsked     { gap_id: Uuid, gap_name: Box<str>, question: Box<str> },
+    SolverProgress    {              // new
+        gap_id:        Uuid,
+        gap_name:      Box<str>,
+        iteration:     u32,
+        max_iterations: u32,
+        step:          Box<str>,           // "prompting" | "code: python3" | "ask" | "done"
+        last_result:   Option<Box<str>>,   // "exit 0" | "exit 1" | "timeout" | "guard rejected" | "answered" | "done" | "exhausted"
+    },
 }
 ```
 
-### Blackboard changes
-
-New field:
+### Solver struct change (in `solver.rs`)
 
 ```rust
-solver_states: DashMap<Uuid, SolverState>,
-```
-
-New methods (same mutation + emit pattern as `set_gap_state`, `append_evidence`, etc.):
-
-```rust
-pub(crate) fn update_solver_state(&self, state: SolverState) {
-    self.solver_states.insert(state.gap_id, state);
-    let _ = self.tx.send(self.snapshot_json());
-}
-
-pub(crate) fn remove_solver_state(&self, gap_id: &Uuid) {
-    self.solver_states.remove(gap_id);
-    let _ = self.tx.send(self.snapshot_json());
+pub(crate) struct Solver {
+    provider:    Arc<dyn Provider>,
+    guard:       Arc<ArtifactGuard>,
+    environment: String,
+    tx:          broadcast::Sender<signal::Payload>,  // new
 }
 ```
 
-### Snapshot change
+The Orchestrator passes `self.tx.clone()` at construction in `drive_gaps`. The Solver continues to take `&Blackboard` in `run()` for evidence, approvals, and questions — only the progress notifications go via `self.tx`.
+
+### Step label (in `solver.rs`)
+
+Rather than a separate enum, `Step` gains a display method:
 
 ```rust
-pub(crate) struct BlackboardSnapshot {
-    intent: Option<Box<str>>,
-    gaps: HashMap<Uuid, Gap>,
-    evidences: HashMap<Uuid, Vec<Evidence>>,
-    solver_states: HashMap<Uuid, SolverState>,  // new
+impl Step {
+    fn label(&self) -> Box<str> {
+        match self {
+            Step::Code { interpreter, .. } => format!("code: {interpreter}").into(),
+            Step::Ask  { .. }              => "ask".into(),
+            Step::Done { .. }              => "done".into(),
+        }
+    }
 }
 ```
 
 ### Solver emission points
 
-The Solver keeps a local `SolverState`, mutates it, and calls `blackboard.update_solver_state(state.clone())` at each transition:
+The Solver constructs `SolverProgress` from local variables and calls `self.tx.send(...)` at each transition:
 
 | Moment | `step` | `last_result` |
 |--------|--------|---------------|
-| Top of iteration, before LLM call | `Prompting` | unchanged |
-| After parsing `Code` step, before execution | `Executing { interpreter }` | unchanged |
-| After code execution completes | `Executing { interpreter }` | `"exit 0"` / `"exit 1"` / `"timeout"` / `"guard rejected"` |
-| After parsing `Ask` step | `Waiting` | unchanged |
-| After receiving human answer | `Prompting` | `"answered"` |
-| On `Done` or iteration exhaustion | `Finished` | `"done"` / `"exhausted"` |
+| Top of iteration, before LLM call | `"prompting"` | unchanged |
+| After parsing `Code` step, before execution | `"code: {interpreter}"` | unchanged |
+| After code execution completes | `"code: {interpreter}"` | `"exit 0"` / `"exit 1"` / `"timeout"` / `"guard rejected"` |
+| After parsing `Ask` step | `"ask"` | unchanged |
+| After receiving human answer | `"prompting"` | `"answered"` |
+| On `Done` or iteration exhaustion | `"done"` | `"done"` / `"exhausted"` |
 
-`blackboard.remove_solver_state(&gap_id)` is called right before `Solver::run()` returns, so the snapshot reflects only active solvers.
+No cleanup call is needed. When the Solver drops, its `tx` clone is released. The consumer sees the gap transition to `Closed` via the next `Snapshot` and discards its local solver state entry.
 
 ## Alternatives considered
 
-**Watch channels (Solver owns `watch::Sender`, Blackboard reads `watch::Receiver`).**
-Eliminates explicit push calls and provides automatic dead-solver detection. Rejected because it loses snapshot emission on each state change — the Blackboard would only see updated solver state passively when some other mutation triggers a snapshot.
+**Store solver state on the Blackboard (`DashMap<Uuid, SolverState>` + `remove_solver_state`).**
+Reuses the existing snapshot emission path. Rejected because it grows the Blackboard with data that does not belong there. The Blackboard outlives every Solver; an insert-then-remove pattern creates a cleanup obligation and a leak risk on solver panic. Solver progress is observer data, not workspace state.
 
-**Separate `Event` variants for solver lifecycle (`SolverStarted`, `SolverIteration`, etc.).**
-Creates a parallel state channel alongside snapshots. Consumers must reconcile two streams to build a complete picture. Rejected in favor of one unified snapshot that carries everything.
+**Watch channels (Solver owns `watch::Sender`, Blackboard reads `watch::Receiver`).**
+Provides automatic dead-solver detection. Rejected because it requires the Blackboard to poll or subscribe to per-solver channels, adding coupling and complexity.
 
 **Tracing-only (no event bus, just structured logs).**
 Adequate for operators but invisible to the CLI and future frontends. Does not solve the stated problem.
@@ -101,20 +94,22 @@ Adequate for operators but invisible to the CLI and future frontends. Does not s
 
 **Positive:**
 
-- One snapshot payload contains everything a consumer needs: intent, gaps, evidence, and solver progress. No stream reconciliation.
-- Late-joining consumers get full state on the first snapshot.
-- Follows the existing Blackboard mutation pattern — no new concurrency primitives, no new event types.
+- Blackboard is not modified. Its invariant — durable workspace state only — is preserved.
+- No cleanup. The Solver dying is sufficient; the consumer reconciles via the next `Snapshot`.
+- Follows the established pattern: `ApprovalRequested` and `QuestionAsked` already fire directly from the Solver via `signal_tx()`. `SolverProgress` is the same pattern.
+- `Step::label()` eliminates a redundant enum (`StepKind`) and keeps the step display co-located with the step definition.
 
 **Negative:**
 
-- Snapshot frequency increases. Solvers emit ~6 state updates per iteration × up to 10 iterations × N concurrent solvers. For 3 solvers averaging 3 iterations, that is ~54 additional snapshots per run. The broadcast channel must not lag.
-- `last_result` is a compact summary string, not the full stdout. If a consumer needs full output, that requires a different mechanism (not in scope).
+- A consumer that joins mid-run has no solver progress history — it must wait for the next `SolverProgress` event to populate its local map. This is acceptable: solver progress is inherently live data, not replay data.
+- `last_result` is a compact summary string, not full stdout. Full output requires a separate mechanism (not in scope).
 
 **Neutral:**
 
-- No changes to `Event` variants, event bus, or Orchestrator.
-- `ApprovalRequested` and `QuestionAsked` events remain separate — they serve the attention/input flow, not the state flow.
+- `Snapshot` frequency is unchanged. Progress events are additive, not substitutive.
+- `ApprovalRequested` and `QuestionAsked` continue unchanged — they serve the attention/input flow.
+- `BlackboardSnapshot` is unchanged.
 
 ## Implementation scope
 
-Two files: `src/moss/blackboard.rs` and `src/moss/solver.rs`.
+Three files: `src/moss/signal.rs`, `src/moss/solver.rs`, `src/moss/orchestrator.rs`.

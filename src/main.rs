@@ -22,7 +22,8 @@ async fn main() {
         }
     };
 
-    let mut cli = Cli::new(Moss::new(provider));
+    let (moss, rx) = Moss::new(provider);
+    let mut cli = Cli::new(moss, rx);
 
     if let Err(e) = cli.run().await {
         tracing::error!(error = %e, "fatal");

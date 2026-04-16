@@ -1,53 +1,69 @@
-use tokio::sync::broadcast;
+use std::collections::HashMap;
 
-/// All events emitted on the signal bus.
-#[derive(Debug, Clone)]
+use tokio::sync::oneshot;
+use uuid::Uuid;
+
+use super::types::{BlackboardSnapshot, Evidence, Gap};
+
+#[derive(Debug)]
 pub enum Event {
-    /// Full blackboard state snapshot — emitted after every mutation.
-    Snapshot(Box<str>),
-    /// A gap was held by the ArtifactGuard and needs human approval before proceeding.
-    ApprovalRequested {
-        gap_id: uuid::Uuid,
-        gap_name: Box<str>,
-        reason: Box<str>,
+    BlackboardSnapshot {
+        intent:    Option<Box<str>>,
+        gaps:      HashMap<Uuid, Gap>,
+        evidences: HashMap<Uuid, Vec<Evidence>>,
     },
-    /// The Solver asked the human a question (via an `~~~ask` block).
-    QuestionAsked {
-        gap_id: uuid::Uuid,
+    SolverProgress {
+        gap_id:         Uuid,
+        gap_name:       Box<str>,
+        iteration:      u32,
+        max_iterations: u32,
+        step:           Box<str>,
+        last_result:    Option<Box<str>>,
+    },
+    Approval {
+        gap_id:   Uuid,
+        gap_name: Box<str>,
+        reason:   Box<str>,
+        tx:       oneshot::Sender<bool>,
+    },
+    Question {
+        gap_id:   Uuid,
         gap_name: Box<str>,
         question: Box<str>,
+        tx:       oneshot::Sender<String>,
     },
 }
 
-pub type Payload = Event;
-
-pub(crate) fn channel(capacity: usize) -> (broadcast::Sender<Payload>, broadcast::Receiver<Payload>) {
-    broadcast::channel(capacity)
+impl From<BlackboardSnapshot> for Event {
+    fn from(snap: BlackboardSnapshot) -> Self {
+        let (intent, gaps, evidences) = snap.into_parts();
+        Self::BlackboardSnapshot { intent, gaps, evidences }
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use tokio::sync::mpsc;
     use super::*;
+    use crate::moss::blackboard::Blackboard;
 
     #[tokio::test]
-    async fn subscriber_receives_snapshot() {
-        let (tx, mut rx) = channel(16);
-        let _ = tx.send(Event::Snapshot("hello".into()));
-        assert!(matches!(rx.recv().await.unwrap(), Event::Snapshot(_)));
+    async fn receiver_gets_snapshot() {
+        let (btx, _brx) = mpsc::channel::<Event>(1);
+        let bb = Blackboard::new(btx);
+        let snap = bb.snapshot();
+        let (tx, mut rx) = mpsc::channel::<Event>(16);
+        tx.try_send(snap.into()).ok();
+        assert!(matches!(rx.recv().await.unwrap(), Event::BlackboardSnapshot { .. }));
     }
 
     #[tokio::test]
-    async fn no_subscriber_does_not_panic() {
-        let (tx, _) = channel(16);
-        let _ = tx.send(Event::Snapshot("ignored".into()));
-    }
-
-    #[tokio::test]
-    async fn independent_subscribers_each_get_the_event() {
-        let (tx, mut rx1) = channel(16);
-        let mut rx2 = tx.subscribe();
-        let _ = tx.send(Event::Snapshot("ping".into()));
-        assert!(matches!(rx1.recv().await.unwrap(), Event::Snapshot(_)));
-        assert!(matches!(rx2.recv().await.unwrap(), Event::Snapshot(_)));
+    async fn send_with_no_receiver_does_not_panic() {
+        let (btx, _brx) = mpsc::channel::<Event>(1);
+        let bb = Blackboard::new(btx);
+        let snap = bb.snapshot();
+        let (tx, rx) = mpsc::channel::<Event>(16);
+        drop(rx);
+        tx.try_send(snap.into()).ok();
     }
 }

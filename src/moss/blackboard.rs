@@ -1,92 +1,13 @@
 use std::sync::Mutex;
-use std::collections::HashMap;
 
 use dashmap::DashMap;
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use uuid::Uuid;
 
 use crate::error::MossError;
-use tokio::sync::{broadcast, oneshot};
+use tokio::sync::mpsc;
 
 use super::signal;
-
-// ── Gap ───────────────────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub(crate) enum GapState {
-    Blocked,
-    Ready,
-    Assigned,
-    Closed,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct Gap {
-    gap_id: Uuid,
-    name: Box<str>,
-    state: GapState,
-    description: Box<str>,
-    dependencies: Vec<Box<str>>,
-    constraints: Option<Value>,
-    expected_output: Option<Box<str>>,
-}
-
-impl Gap {
-    pub(crate) fn new(
-        name: impl Into<Box<str>>,
-        description: impl Into<Box<str>>,
-        dependencies: Vec<Box<str>>,
-        constraints: Option<Value>,
-        expected_output: Option<Box<str>>,
-    ) -> Self {
-        let deps = dependencies;
-        let has_deps = !deps.is_empty();
-        Self {
-            gap_id: Uuid::new_v4(),
-            name: name.into(),
-            state: if has_deps { GapState::Blocked } else { GapState::Ready },
-            description: description.into(),
-            dependencies: deps,
-            constraints,
-            expected_output,
-        }
-    }
-
-    pub(crate) fn gap_id(&self) -> Uuid { self.gap_id }
-    pub(crate) fn name(&self) -> &str { &self.name }
-    pub(crate) fn state(&self) -> &GapState { &self.state }
-    pub(crate) fn description(&self) -> &str { &self.description }
-    pub(crate) fn dependencies(&self) -> &[Box<str>] { &self.dependencies }
-    pub(crate) fn constraints(&self) -> Option<&Value> { self.constraints.as_ref() }
-    pub(crate) fn expected_output(&self) -> Option<&str> { self.expected_output.as_deref() }
-    pub(crate) fn set_state(&mut self, state: GapState) { self.state = state; }
-}
-
-// ── Evidence ──────────────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) enum EvidenceStatus {
-    Success,
-    Failure { reason: String },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct Evidence {
-    gap_id: Uuid,
-    content: Value,
-    status: EvidenceStatus,
-}
-
-impl Evidence {
-    pub(crate) fn new(gap_id: Uuid, content: Value, status: EvidenceStatus) -> Self {
-        Self { gap_id, content, status }
-    }
-
-    pub(crate) fn gap_id(&self) -> Uuid { self.gap_id }
-    pub(crate) fn content(&self) -> &Value { &self.content }
-    pub(crate) fn status(&self) -> &EvidenceStatus { &self.status }
-}
+use super::types::{BlackboardSnapshot, Evidence, Gap, GapState};
 
 // ── Blackboard ────────────────────────────────────────────────────────────────
 
@@ -96,38 +17,23 @@ pub(crate) struct Blackboard {
     gaps: DashMap<Uuid, Gap>,
     name_index: DashMap<Box<str>, Uuid>,
     evidences: DashMap<Uuid, Vec<Evidence>>,
-    pending_approvals: DashMap<Uuid, oneshot::Sender<bool>>,
-    pending_questions: DashMap<Uuid, oneshot::Sender<String>>,
-    tx: broadcast::Sender<signal::Payload>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct BlackboardSnapshot {
-    intent: Option<Box<str>>,
-    gaps: HashMap<Uuid, Gap>,
-    evidences: HashMap<Uuid, Vec<Evidence>>,
+    tx: mpsc::Sender<signal::Event>,
 }
 
 impl Blackboard {
-    pub(crate) fn new(tx: broadcast::Sender<signal::Payload>) -> Self {
+    pub(crate) fn new(tx: mpsc::Sender<signal::Event>) -> Self {
         Self {
             intent: Mutex::new(None),
             gaps: DashMap::new(),
             name_index: DashMap::new(),
             evidences: DashMap::new(),
-            pending_approvals: DashMap::new(),
-            pending_questions: DashMap::new(),
             tx,
         }
     }
 
-    pub(crate) fn signal_tx(&self) -> &broadcast::Sender<signal::Payload> {
-        &self.tx
-    }
-
     pub(crate) fn set_intent(&self, intent: impl Into<Box<str>>) {
         *self.intent.lock().unwrap() = Some(intent.into());
-        let _ = self.tx.send(self.snapshot_json());
+        let _ = self.tx.try_send(self.snapshot().into());
     }
 
     pub(crate) fn get_intent(&self) -> Option<Box<str>> {
@@ -145,7 +51,7 @@ impl Blackboard {
         let name = gap.name.clone();
         self.gaps.insert(id, gap);
         self.name_index.insert(name, id);
-        let _ = self.tx.send(self.snapshot_json());
+        let _ = self.tx.try_send(self.snapshot().into());
         Ok(())
     }
 
@@ -154,13 +60,13 @@ impl Blackboard {
             .get_mut(gap_id)
             .ok_or_else(|| MossError::Blackboard(format!("gap {gap_id} not found")))?
             .set_state(new_state);
-        let _ = self.tx.send(self.snapshot_json());
+        let _ = self.tx.try_send(self.snapshot().into());
         Ok(())
     }
 
     pub(crate) fn append_evidence(&self, ev: Evidence) {
         self.evidences.entry(ev.gap_id()).or_default().push(ev);
-        let _ = self.tx.send(self.snapshot_json());
+        let _ = self.tx.try_send(self.snapshot().into());
     }
 
     pub(crate) fn get_gap(&self, gap_id: &Uuid) -> Option<Gap> {
@@ -225,26 +131,6 @@ impl Blackboard {
         self.gaps.iter().all(|g| g.state == GapState::Closed)
     }
 
-    pub(crate) fn register_approval(&self, gap_id: Uuid, sender: oneshot::Sender<bool>) {
-        self.pending_approvals.insert(gap_id, sender);
-    }
-
-    pub(crate) fn approve(&self, gap_id: Uuid, approved: bool) {
-        if let Some((_, sender)) = self.pending_approvals.remove(&gap_id) {
-            let _ = sender.send(approved);
-        }
-    }
-
-    pub(crate) fn register_question(&self, gap_id: Uuid, sender: oneshot::Sender<String>) {
-        self.pending_questions.insert(gap_id, sender);
-    }
-
-    pub(crate) fn answer_question(&self, gap_id: Uuid, answer: String) {
-        if let Some((_, sender)) = self.pending_questions.remove(&gap_id) {
-            let _ = sender.send(answer);
-        }
-    }
-
     pub(crate) fn all_evidence(&self) -> Vec<Evidence> {
         self.evidences
             .iter()
@@ -253,16 +139,11 @@ impl Blackboard {
     }
 
     pub(crate) fn snapshot(&self) -> BlackboardSnapshot {
-        BlackboardSnapshot {
-            intent: self.intent.lock().unwrap().clone(),
-            gaps: self.gaps.iter().map(|e| (*e.key(), e.value().clone())).collect(),
-            evidences: self.evidences.iter().map(|e| (*e.key(), e.value().clone())).collect(),
-        }
-    }
-
-    fn snapshot_json(&self) -> super::signal::Event {
-        let json: Box<str> = serde_json::to_string(&self.snapshot()).unwrap_or_default().into();
-        super::signal::Event::Snapshot(json)
+        BlackboardSnapshot::new(
+            self.intent.lock().unwrap().clone(),
+            self.gaps.iter().map(|e| (*e.key(), e.value().clone())).collect(),
+            self.evidences.iter().map(|e| (*e.key(), e.value().clone())).collect(),
+        )
     }
 }
 
@@ -271,10 +152,11 @@ impl Blackboard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::types::EvidenceStatus;
     use serde_json::json;
-    use crate::moss::signal;
+    use tokio::sync::mpsc;
 
-    fn bb() -> Blackboard { Blackboard::new(signal::channel(1).0) }
+    fn bb() -> Blackboard { Blackboard::new(mpsc::channel(1).0) }
 
     fn gap(name: &str, deps: Vec<&str>) -> Gap {
         Gap::new(

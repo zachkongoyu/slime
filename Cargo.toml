@@ -19,3 +19,5 @@ minijinja = { version = "2", features = ["json"] }
 tempfile = "3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+ratatui    = "0.29"
+crossterm  = "0.28"

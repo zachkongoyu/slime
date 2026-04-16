@@ -1,18 +1,17 @@
 use std::sync::{Arc, Mutex};
 
 use minijinja::{Environment, context};
-use tokio::sync::broadcast;
+use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tracing::{info, warn};
-use uuid::Uuid;
-
 use crate::error::MossError;
 use crate::providers::{Message, Role, Provider};
 
 use super::artifact_guard::ArtifactGuard;
-use super::blackboard::{Blackboard, EvidenceStatus, Gap, GapState};
+use super::blackboard::Blackboard;
+use super::types::{Gap, GapState};
 use super::decomposition::Decomposition;
-use super::signal::{self, Event};
+use super::signal::{self};
 use super::solver::Solver;
 
 pub(crate) struct Orchestrator {
@@ -20,7 +19,7 @@ pub(crate) struct Orchestrator {
     guard: Arc<ArtifactGuard>,
     environment: String,
     blackboard: Mutex<Arc<Blackboard>>,
-    tx: broadcast::Sender<signal::Payload>,
+    tx: mpsc::Sender<signal::Event>,
 }
 
 /// Probe the local system for available runtimes and report OS info.
@@ -65,7 +64,7 @@ fn detect_environment() -> String {
 }
 
 impl Orchestrator {
-    pub(crate) fn new(provider: Arc<dyn Provider>, tx: broadcast::Sender<signal::Payload>) -> Self {
+    pub(crate) fn new(provider: Arc<dyn Provider>, tx: mpsc::Sender<signal::Event>) -> Self {
         let guard = Arc::new(ArtifactGuard::new());
         let environment = detect_environment();
         Self {
@@ -75,14 +74,6 @@ impl Orchestrator {
             blackboard: Mutex::new(Arc::new(Blackboard::new(tx.clone()))),
             tx,
         }
-    }
-
-    pub(crate) fn approve(&self, gap_id: Uuid, approved: bool) {
-        self.blackboard.lock().unwrap().approve(gap_id, approved);
-    }
-
-    pub(crate) fn answer(&self, gap_id: Uuid, answer: String) {
-        self.blackboard.lock().unwrap().answer_question(gap_id, answer);
     }
 
     /// Run a single user query end-to-end.
@@ -133,25 +124,26 @@ impl Orchestrator {
                     Arc::clone(&self.provider),
                     Arc::clone(&self.guard),
                     self.environment.clone(),
+                    self.tx.clone(),
                 );
                 let bb = Arc::clone(&blackboard);
 
-                info!(gap = %gap.name(), "dispatched");
+                // info!(gap = %gap.name(), "dispatched");
 
                 tasks.spawn(async move {
                     solver.run(&gap, &bb).await?;
 
-                    let last_success = bb
-                        .get_evidence(&gap.gap_id())
-                        .last()
-                        .map(|e| matches!(e.status(), EvidenceStatus::Success))
-                        .unwrap_or(false);
+                    // let last_success = bb
+                    //     .get_evidence(&gap.gap_id())
+                    //     .last()
+                    //     .map(|e| matches!(e.status(), EvidenceStatus::Success))
+                    //     .unwrap_or(false);
 
-                    if last_success {
-                        info!(gap = %gap.name(), "closed (success)");
-                    } else {
-                        warn!(gap = %gap.name(), "solver failed — closing");
-                    }
+                    // if last_success {
+                    //     info!(gap = %gap.name(), "closed (success)");
+                    // } else {
+                    //     warn!(gap = %gap.name(), "solver failed — closing");
+                    // }
                     bb.set_gap_state(&gap.gap_id(), GapState::Closed)
                 });
             }
@@ -202,9 +194,9 @@ impl Orchestrator {
 
         let decomposition: Decomposition = serde_json::from_str(json_str)?;
 
-        if let Ok(pretty) = serde_json::to_string_pretty(&decomposition) {
-            info!("Decomposed DAG:\n{}", pretty);
-        }
+        // if let Ok(pretty) = serde_json::to_string_pretty(&decomposition) {
+        //     info!("Decomposed DAG:\n{}", pretty);
+        // }
 
         Ok(decomposition)
     }
@@ -233,7 +225,7 @@ impl Orchestrator {
 
         let messages = vec![Message { role: Role::User, content: rendered.into_boxed_str() }];
 
-        info!("synthesizing final answer");
+        // info!("synthesizing final answer");
         let response = self.provider.complete_chat(messages).await?;
 
         Ok(response)
@@ -249,16 +241,17 @@ mod tests {
     use async_trait::async_trait;
 
     use crate::error::ProviderError;
-    use crate::moss::blackboard::{Blackboard, Gap, GapState};
-    use crate::moss::signal;
+    use crate::moss::blackboard::Blackboard;
+    use crate::moss::types::{Gap, GapState};
+    use tokio::sync::mpsc;
     use crate::providers::{Message, Provider};
 
     use super::Orchestrator;
 
-    fn bb() -> Arc<Blackboard> { Arc::new(Blackboard::new(signal::channel(1).0)) }
+    fn bb() -> Arc<Blackboard> { Arc::new(Blackboard::new(mpsc::channel(1).0)) }
 
     fn orchestrator(provider: impl Provider + 'static) -> Orchestrator {
-        let (tx, _rx) = signal::channel(16);
+        let (tx, _rx) = mpsc::channel(16);
         Orchestrator::new(Arc::new(provider), tx)
     }
 
