@@ -8,7 +8,7 @@ use serde_json::Value;
 use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 use crate::error::MossError;
 use crate::providers::{Message, Role, Provider};

@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use minijinja::{Environment, context};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
-use tracing::{info, warn};
+use tracing::warn;
 use crate::error::MossError;
 use crate::providers::{Message, Role, Provider};
 

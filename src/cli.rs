@@ -4,9 +4,16 @@ use std::io::{self, Write};
 use crossterm::{
     event::{self, KeyCode, KeyEvent, KeyModifiers},
     execute,
+    style::{Attribute, SetAttribute, SetForegroundColor, Color as CtColor, ResetColor},
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use ratatui::{backend::CrosstermBackend, text::Line, widgets::Paragraph, Frame, Terminal};
+use ratatui::{
+    backend::CrosstermBackend,
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::Paragraph,
+    Frame, Terminal,
+};
 use tokio::io::AsyncBufReadExt;
 use tokio::sync::{mpsc, oneshot};
 
@@ -144,16 +151,91 @@ impl Cli {
     }
 
     pub async fn run(&mut self) -> Result<(), MossError> {
+        self.print_welcome()?;
+
         let stdin = tokio::io::stdin();
         let mut lines = tokio::io::BufReader::new(stdin).lines();
         loop {
-            print!("> ");
-            io::stdout().flush()?;
+            self.print_prompt()?;
             match lines.next_line().await? {
                 Some(raw) => self.handle_input(raw.trim_end()).await?,
                 None      => break,
             }
         }
+        Ok(())
+    }
+
+    fn print_welcome(&self) -> io::Result<()> {
+        let width = 80;
+        let border = CtColor::Rgb { r: 88, g: 88, b: 88 };
+        let title = CtColor::Rgb { r: 138, g: 180, b: 248 };
+        let dim = CtColor::Rgb { r: 120, g: 120, b: 120 };
+        let green = CtColor::Rgb { r: 152, g: 195, b: 121 };
+
+        // ASCII art logo
+        let logo = [
+            r"  ███╗   ███╗ ",
+            r"  ████╗ ████║ ",
+            r"  ██╔████╔██║ ",
+            r"  ██║╚██╔╝██║ ",
+            r"  ██║ ╚═╝ ██║ ",
+            r"  ╚═╝     ╚═╝ ",
+        ];
+
+        println!();
+        // Top border
+        execute!(io::stdout(), SetForegroundColor(border))?;
+        print!("╭───");
+        execute!(io::stdout(), SetForegroundColor(title), SetAttribute(Attribute::Bold))?;
+        print!(" Moss v0.1.0 ");
+        execute!(io::stdout(), ResetColor, SetAttribute(Attribute::Reset), SetForegroundColor(border))?;
+        println!("{}╮", "─".repeat(width - 17));
+
+        // Logo lines
+        for line in &logo {
+            execute!(io::stdout(), SetForegroundColor(border))?;
+            print!("│");
+            execute!(io::stdout(), SetForegroundColor(green), SetAttribute(Attribute::Bold))?;
+            print!("{}", line);
+            execute!(io::stdout(), ResetColor, SetAttribute(Attribute::Reset), SetForegroundColor(border))?;
+            println!("{}│", " ".repeat(width - 2 - line.chars().count()));
+        }
+
+        // Tagline
+        execute!(io::stdout(), SetForegroundColor(border))?;
+        print!("│");
+        execute!(io::stdout(), SetForegroundColor(dim))?;
+        let tagline = "  Local-first AI Operating System";
+        print!("{}", tagline);
+        execute!(io::stdout(), SetForegroundColor(border))?;
+        println!("{}│", " ".repeat(width - 2 - tagline.len()));
+
+        // Empty line
+        execute!(io::stdout(), SetForegroundColor(border))?;
+        println!("│{}│", " ".repeat(width - 2));
+
+        // Bottom border
+        execute!(io::stdout(), SetForegroundColor(border))?;
+        println!("╰{}╯", "─".repeat(width - 2));
+        execute!(io::stdout(), ResetColor)?;
+        println!();
+
+        Ok(())
+    }
+
+    fn print_prompt(&self) -> io::Result<()> {
+        let dim = CtColor::Rgb { r: 88, g: 88, b: 88 };
+        let cyan = CtColor::Rgb { r: 138, g: 180, b: 248 };
+
+        // Separator line
+        execute!(io::stdout(), SetForegroundColor(dim))?;
+        println!("{}", "─".repeat(80));
+
+        // Prompt
+        execute!(io::stdout(), SetForegroundColor(cyan), SetAttribute(Attribute::Bold))?;
+        print!("❯ ");
+        execute!(io::stdout(), ResetColor, SetAttribute(Attribute::Reset))?;
+        io::stdout().flush()?;
         Ok(())
     }
 
@@ -198,11 +280,59 @@ impl Cli {
                     }
                 };
 
+                // Drain any remaining events to show final state
+                while let Ok(ev) = self.rx.try_recv() {
+                    self.state.apply(ev);
+                }
+                terminal.draw(|f| render_with_footer(f, &self.state, " Press Enter to continue... "))?;
+
+                // Wait for any key before leaving
+                loop {
+                    match key_rx.recv().await {
+                        Some(key) => {
+                            if key.code == KeyCode::Char('c')
+                                && key.modifiers.contains(KeyModifiers::CONTROL)
+                            {
+                                break;
+                            }
+                            if matches!(key.code, KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q')) {
+                                break;
+                            }
+                        }
+                        None => break, // channel closed
+                    }
+                }
+
                 drop(_guard); // leave alternate screen before printing
                 match result {
-                    Ok(response) if !response.is_empty() => println!("{response}"),
+                    Ok(response) if !response.is_empty() => {
+                        // Print response with styled header
+                        execute!(
+                            io::stdout(),
+                            SetForegroundColor(CtColor::Rgb { r: 152, g: 195, b: 121 }),
+                            SetAttribute(Attribute::Bold)
+                        )?;
+                        println!();
+                        execute!(io::stdout(), SetForegroundColor(CtColor::Rgb { r: 88, g: 88, b: 88 }))?;
+                        println!("{}", "─".repeat(80));
+                        execute!(io::stdout(), SetForegroundColor(CtColor::Rgb { r: 152, g: 195, b: 121 }), SetAttribute(Attribute::Bold))?;
+                        println!("✔ Moss");
+                        execute!(io::stdout(), ResetColor, SetAttribute(Attribute::Reset))?;
+                        execute!(io::stdout(), SetForegroundColor(CtColor::Rgb { r: 220, g: 220, b: 220 }))?;
+                        println!("{response}");
+                        execute!(io::stdout(), ResetColor)?;
+                    }
                     Ok(_)  => {}
-                    Err(e) => eprintln!("[moss] error: {e}"),
+                    Err(e) => {
+                        execute!(
+                            io::stdout(),
+                            SetForegroundColor(CtColor::Rgb { r: 190, g: 80, b: 70 }),
+                            SetAttribute(Attribute::Bold)
+                        )?;
+                        eprint!("\n✘ Error: ");
+                        execute!(io::stdout(), ResetColor, SetAttribute(Attribute::Reset))?;
+                        eprintln!("{e}\n");
+                    }
                 }
             }
         }
@@ -217,67 +347,89 @@ const CARD_TOTAL: usize = CARD_INNER + 2; // + 2 border chars
 
 fn render(frame: &mut Frame, state: &UiState) {
     let w = frame.area().width as usize;
-    frame.render_widget(Paragraph::new(build_lines(state, w)), frame.area());
+    frame.render_widget(Paragraph::new(build_lines(state, w, None)), frame.area());
 }
 
-fn build_lines(state: &UiState, w: usize) -> Vec<Line<'static>> {
+fn render_with_footer(frame: &mut Frame, state: &UiState, footer: &str) {
+    let w = frame.area().width as usize;
+    frame.render_widget(Paragraph::new(build_lines(state, w, Some(footer))), frame.area());
+}
+
+// ── Color palette (Claude Code inspired) ──────────────────────────────────────
+
+const CLR_BORDER:   Color = Color::Rgb(88, 88, 88);    // dim gray
+const CLR_TITLE:    Color = Color::Rgb(138, 180, 248); // soft blue
+const CLR_SECTION:  Color = Color::Rgb(198, 120, 221); // purple
+const CLR_LABEL:    Color = Color::Rgb(150, 150, 150); // muted
+const CLR_VALUE:    Color = Color::Rgb(220, 220, 220); // bright text
+const CLR_DONE:     Color = Color::Rgb(152, 195, 121); // green
+const CLR_RUNNING:  Color = Color::Rgb(229, 192, 123); // yellow/amber
+const CLR_READY:    Color = Color::Rgb(97, 175, 239);  // blue
+const CLR_BLOCKED:  Color = Color::Rgb(190, 80,  70);  // red
+const CLR_WARN:     Color = Color::Rgb(255, 170,  66); // orange
+const CLR_FOOTER:   Color = Color::Rgb(120, 120, 120); // dim
+
+fn build_lines(state: &UiState, w: usize, footer: Option<&str>) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
 
-    lines.push(box_top(w, &format!(" Moss — query: {} ", state.query)));
+    lines.push(styled_box_top(w, " Moss ", &state.query));
 
     // Blackboard summary
     let snap = state.snapshot.as_ref();
     let intent = snap.and_then(|s| s.intent()).unwrap_or("(pending)");
-    lines.push(box_row(w, &format!(" intent: {intent}")));
-    lines.push(box_row(w, &format!(" gaps: {} total", state.gap_order.len())));
+    lines.push(styled_row_kv(w, "intent", intent));
+    lines.push(styled_row_kv(w, "gaps", &format!("{} total", state.gap_order.len())));
 
     let gaps_snap = snap.map(|s| s.gaps().collect::<Vec<_>>()).unwrap_or_default();
     let blocked  = gaps_snap.iter().filter(|g| *g.state() == GapState::Blocked).count();
     let ready    = gaps_snap.iter().filter(|g| *g.state() == GapState::Ready).count();
     let assigned = gaps_snap.iter().filter(|g| *g.state() == GapState::Assigned).count();
     let done     = gaps_snap.iter().filter(|g| *g.state() == GapState::Closed).count();
-    lines.push(box_row(w, &format!(" states: {blocked} blocked | {ready} ready | {assigned} running | {done} done")));
+    lines.push(styled_row_states(w, blocked, ready, assigned, done));
 
     let pending_a = usize::from(matches!(state.attention, Some(Attention::Approval { .. })));
     let pending_q = usize::from(matches!(state.attention, Some(Attention::Question { .. })));
-    lines.push(box_row(w, &format!(
-        " pending approvals: {pending_a} | pending questions: {pending_q} | evidence entries: {}",
+    lines.push(styled_row_kv(w, "pending", &format!(
+        "{pending_a} approvals | {pending_q} questions | {} evidence",
         state.evidence_count
     )));
 
     // Live DAG
-    lines.push(box_sep(w, " Live DAG "));
+    lines.push(styled_box_sep(w, " Gaps "));
     let inner_w = w.saturating_sub(2);
     let per_row = ((inner_w + 1) / (CARD_TOTAL + 1)).max(1);
 
     if state.gap_order.is_empty() {
-        lines.push(box_row(w, " (waiting for gaps\u{2026})"));
+        lines.push(styled_row_dim(w, "(waiting for gaps\u{2026})"));
     } else {
         for chunk in state.gap_order.chunks(per_row) {
             for row in card_chunk_lines(chunk, snap, &state.progress, inner_w) {
                 lines.push(row);
             }
-            lines.push(box_row(w, ""));
+            lines.push(styled_box_row_empty(w));
         }
     }
 
     // Attention
     if let Some(ref attn) = state.attention {
-        lines.push(box_sep(w, " Attention "));
+        lines.push(styled_box_sep_warn(w, " Attention "));
         match attn {
             Attention::Approval { gap_name, reason, .. } => {
-                lines.push(box_row(w, &format!(" Approval needed: {gap_name}")));
-                lines.push(box_row(w, &format!("   reason: {reason}")));
-                lines.push(box_row(w, &format!("   approve? [y/N] {}_", state.input_buf)));
+                lines.push(styled_row_warn(w, &format!("Approval needed: {gap_name}")));
+                lines.push(styled_row_kv(w, "reason", reason));
+                lines.push(styled_row_input(w, "approve? [y/N]", &state.input_buf));
             }
             Attention::Question { gap_name, question, .. } => {
-                lines.push(box_row(w, &format!(" {gap_name} asks: {question}")));
-                lines.push(box_row(w, &format!("   answer: {}_", state.input_buf)));
+                lines.push(styled_row_warn(w, &format!("{gap_name} asks: {question}")));
+                lines.push(styled_row_input(w, "answer", &state.input_buf));
             }
         }
     }
 
-    lines.push(box_bottom(w));
+    match footer {
+        Some(msg) => lines.push(styled_box_bottom_msg(w, msg)),
+        None      => lines.push(styled_box_bottom(w)),
+    }
     lines
 }
 
@@ -289,43 +441,63 @@ fn card_chunk_lines(
     inner_w:  usize,
 ) -> Vec<Line<'static>> {
     let n = names.len();
-    let mut rows = vec![String::new(); 6];
-
     let total_cards_w = n * CARD_TOTAL + n.saturating_sub(1);
     let left_pad = (inner_w.saturating_sub(total_cards_w)) / 2;
 
+    // Build each row as Vec<Span> to preserve styling
+    let mut row_spans: Vec<Vec<Span<'static>>> = vec![Vec::new(); 6];
+
+    let border = Style::default().fg(CLR_BORDER);
+    let label_style = Style::default().fg(CLR_LABEL);
+
     for (i, name) in names.iter().enumerate() {
-        let state_label = snap
-            .and_then(|s| s.gap_state(name))
-            .map(gap_state_label)
-            .unwrap_or("-");
+        let gap_state = snap.and_then(|s| s.gap_state(name));
+        let state_label = gap_state.map(gap_state_label).unwrap_or("-");
+        let state_color = gap_state.map(gap_state_color).unwrap_or(CLR_LABEL);
+
         let prog     = progress.get(name);
         let iter_str = prog.map_or("-".to_string(), |p| format!("{}/{}", p.iteration, p.max_iterations));
         let step_str = prog.map_or("-", |p| p.step.as_ref()).to_string();
         let last_str = prog.and_then(|p| p.last_result.as_deref()).unwrap_or("-").to_string();
 
-        let content = [
-            card_field("status", state_label),
-            card_field("iter",   &iter_str),
-            card_field("step",   &step_str),
-            card_field("last",   &last_str),
-        ];
         let spacer = if i == 0 { " ".repeat(left_pad) } else { " ".to_string() };
 
-        let title      = format!(" {name} ");
+        let max_name_len = CARD_INNER.saturating_sub(2);
+        let truncated_name: String = name.chars().take(max_name_len).collect();
+        let title = format!(" {truncated_name} ");
         let top_dashes = CARD_INNER.saturating_sub(title.chars().count());
-        rows[0].push_str(&format!("{}┌{}{}┐", spacer, title, "─".repeat(top_dashes)));
-        for (r, line) in content.iter().enumerate() {
-            rows[r + 1].push_str(&format!("{}│{}│", spacer, line));
+
+        // Row 0: top border with title
+        row_spans[0].push(Span::raw(spacer.clone()));
+        row_spans[0].push(Span::styled("╭", border));
+        row_spans[0].push(Span::styled(title, Style::default().fg(state_color).add_modifier(Modifier::BOLD)));
+        row_spans[0].push(Span::styled(format!("{}╮", "─".repeat(top_dashes)), border));
+
+        // Rows 1-4: content
+        let fields: [(_, _, Color); 4] = [
+            ("status", state_label.to_string(), state_color),
+            ("iter",   iter_str,                CLR_VALUE),
+            ("step",   step_str,                CLR_VALUE),
+            ("last",   last_str,                CLR_LABEL),
+        ];
+        for (r, (lbl, val, clr)) in fields.into_iter().enumerate() {
+            row_spans[r + 1].push(Span::raw(spacer.clone()));
+            row_spans[r + 1].push(Span::styled("│", border));
+            row_spans[r + 1].push(Span::styled(format!(" {:<6}  ", lbl), label_style));
+            let val_str = pad_truncate(&val, CARD_INNER - 9);
+            row_spans[r + 1].push(Span::styled(val_str, Style::default().fg(clr)));
+            row_spans[r + 1].push(Span::styled("│", border));
         }
-        rows[5].push_str(&format!("{}└{}┘", spacer, "─".repeat(CARD_INNER)));
+
+        // Row 5: bottom border
+        row_spans[5].push(Span::raw(spacer));
+        row_spans[5].push(Span::styled(format!("╰{}╯", "─".repeat(CARD_INNER)), border));
     }
 
-    rows.into_iter().map(|r| box_row_owned(inner_w, r)).collect()
-}
-
-fn card_field(label: &str, value: &str) -> String {
-    pad_truncate(&format!(" {:<6}  {}", label, value), CARD_INNER)
+    row_spans
+        .into_iter()
+        .map(|spans| styled_box_row_spans(inner_w, spans))
+        .collect()
 }
 
 fn gap_state_label(state: &GapState) -> &'static str {
@@ -337,35 +509,173 @@ fn gap_state_label(state: &GapState) -> &'static str {
     }
 }
 
-// ── Box drawing helpers ───────────────────────────────────────────────────────
+fn gap_state_color(state: &GapState) -> Color {
+    match state {
+        GapState::Blocked  => CLR_BLOCKED,
+        GapState::Ready    => CLR_READY,
+        GapState::Assigned => CLR_RUNNING,
+        GapState::Closed   => CLR_DONE,
+    }
+}
 
-fn box_top(w: usize, title: &str) -> Line<'static> {
+// ── Styled box drawing helpers ────────────────────────────────────────────────
+
+fn styled_box_top(w: usize, label: &str, query: &str) -> Line<'static> {
     let inner = w.saturating_sub(2);
+    let border = Style::default().fg(CLR_BORDER);
+    // Content: " {label}" + "— " + query + " "
+    let content_len = 1 + label.len() + 2 + query.chars().count() + 1;
+    let dashes = inner.saturating_sub(content_len);
+    Line::from(vec![
+        Span::styled("╭", border),
+        Span::styled(format!(" {label}"), Style::default().fg(CLR_TITLE).add_modifier(Modifier::BOLD)),
+        Span::styled("— ", border),
+        Span::styled(query.to_string(), Style::default().fg(CLR_VALUE)),
+        Span::styled(" ", border),
+        Span::styled(format!("{}╮", "─".repeat(dashes)), border),
+    ])
+}
+
+fn styled_box_sep(w: usize, title: &str) -> Line<'static> {
+    let inner = w.saturating_sub(2);
+    let border = Style::default().fg(CLR_BORDER);
     let right = inner.saturating_sub(title.chars().count());
-    Line::from(format!("┌{}{}┐", title, "─".repeat(right)))
+    Line::from(vec![
+        Span::styled("├", border),
+        Span::styled(title.to_string(), Style::default().fg(CLR_SECTION).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("{}┤", "─".repeat(right)), border),
+    ])
 }
 
-fn box_sep(w: usize, title: &str) -> Line<'static> {
+fn styled_box_sep_warn(w: usize, title: &str) -> Line<'static> {
     let inner = w.saturating_sub(2);
+    let border = Style::default().fg(CLR_BORDER);
     let right = inner.saturating_sub(title.chars().count());
-    Line::from(format!("├{}{}┤", title, "─".repeat(right)))
+    Line::from(vec![
+        Span::styled("├", border),
+        Span::styled(title.to_string(), Style::default().fg(CLR_WARN).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("{}┤", "─".repeat(right)), border),
+    ])
 }
 
-fn box_row(w: usize, content: &str) -> Line<'static> {
+fn styled_row_kv(w: usize, key: &str, value: &str) -> Line<'static> {
     let inner = w.saturating_sub(2);
-    Line::from(format!("│{}│", pad_truncate(content, inner)))
+    let border = Style::default().fg(CLR_BORDER);
+    let prefix = format!(" {:<8} ", key);
+    let val_len = inner.saturating_sub(prefix.len());
+    Line::from(vec![
+        Span::styled("│", border),
+        Span::styled(prefix, Style::default().fg(CLR_LABEL)),
+        Span::styled(pad_truncate(value, val_len), Style::default().fg(CLR_VALUE)),
+        Span::styled("│", border),
+    ])
 }
 
-fn box_row_owned(inner_w: usize, content: String) -> Line<'static> {
-    Line::from(format!("│{}│", pad_truncate(&content, inner_w)))
-}
-
-fn box_bottom(w: usize) -> Line<'static> {
+fn styled_row_states(w: usize, blocked: usize, ready: usize, running: usize, done: usize) -> Line<'static> {
     let inner = w.saturating_sub(2);
-    Line::from(format!("└{}┘", "─".repeat(inner)))
+    let border = Style::default().fg(CLR_BORDER);
+    let prefix = " states   ";
+
+    // Build content spans first to calculate actual length
+    let mut content_spans: Vec<Span<'static>> = vec![
+        Span::styled(prefix.to_string(), Style::default().fg(CLR_LABEL)),
+    ];
+    let parts: [(usize, &str, Color); 4] = [
+        (blocked, "blocked", CLR_BLOCKED),
+        (ready,   "ready",   CLR_READY),
+        (running, "running", CLR_RUNNING),
+        (done,    "done",    CLR_DONE),
+    ];
+    for (i, (n, lbl, clr)) in parts.iter().enumerate() {
+        if i > 0 { content_spans.push(Span::styled(" │ ", Style::default().fg(CLR_BORDER))); }
+        content_spans.push(Span::styled(format!("{n}"), Style::default().fg(*clr).add_modifier(Modifier::BOLD)));
+        content_spans.push(Span::styled(format!(" {lbl}"), Style::default().fg(CLR_LABEL)));
+    }
+
+    // Calculate actual content length
+    let used: usize = content_spans.iter().map(|s| s.content.chars().count()).sum();
+    let pad = inner.saturating_sub(used);
+
+    let mut spans = vec![Span::styled("│", border)];
+    spans.extend(content_spans);
+    spans.push(Span::raw(" ".repeat(pad)));
+    spans.push(Span::styled("│", border));
+    Line::from(spans)
 }
 
-/// Pad with spaces or truncate to exactly `width` terminal columns (char-count safe for ASCII/Latin).
+fn styled_row_dim(w: usize, content: &str) -> Line<'static> {
+    let inner = w.saturating_sub(2);
+    let border = Style::default().fg(CLR_BORDER);
+    Line::from(vec![
+        Span::styled("│", border),
+        Span::styled(pad_truncate(&format!(" {content}"), inner), Style::default().fg(CLR_LABEL)),
+        Span::styled("│", border),
+    ])
+}
+
+fn styled_row_warn(w: usize, content: &str) -> Line<'static> {
+    let inner = w.saturating_sub(2);
+    let border = Style::default().fg(CLR_BORDER);
+    Line::from(vec![
+        Span::styled("│", border),
+        Span::styled(pad_truncate(&format!(" {content}"), inner), Style::default().fg(CLR_WARN)),
+        Span::styled("│", border),
+    ])
+}
+
+fn styled_row_input(w: usize, prompt: &str, buf: &str) -> Line<'static> {
+    let inner = w.saturating_sub(2);
+    let border = Style::default().fg(CLR_BORDER);
+    let prefix = format!("   {prompt}: ");
+    let input = format!("{buf}_");
+    let val_len = inner.saturating_sub(prefix.len());
+    Line::from(vec![
+        Span::styled("│", border),
+        Span::styled(prefix, Style::default().fg(CLR_LABEL)),
+        Span::styled(pad_truncate(&input, val_len), Style::default().fg(CLR_VALUE)),
+        Span::styled("│", border),
+    ])
+}
+
+fn styled_box_row_empty(w: usize) -> Line<'static> {
+    let inner = w.saturating_sub(2);
+    let border = Style::default().fg(CLR_BORDER);
+    Line::from(vec![
+        Span::styled("│", border),
+        Span::raw(" ".repeat(inner)),
+        Span::styled("│", border),
+    ])
+}
+
+fn styled_box_row_spans(inner_w: usize, spans: Vec<Span<'static>>) -> Line<'static> {
+    let border = Style::default().fg(CLR_BORDER);
+    let content_len: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+    let pad = inner_w.saturating_sub(content_len);
+    let mut out = vec![Span::styled("│", border)];
+    out.extend(spans);
+    out.push(Span::raw(" ".repeat(pad)));
+    out.push(Span::styled("│", border));
+    Line::from(out)
+}
+
+fn styled_box_bottom(w: usize) -> Line<'static> {
+    let inner = w.saturating_sub(2);
+    let border = Style::default().fg(CLR_BORDER);
+    Line::from(Span::styled(format!("╰{}╯", "─".repeat(inner)), border))
+}
+
+fn styled_box_bottom_msg(w: usize, msg: &str) -> Line<'static> {
+    let inner = w.saturating_sub(2);
+    let border = Style::default().fg(CLR_BORDER);
+    let right = inner.saturating_sub(msg.chars().count());
+    Line::from(vec![
+        Span::styled("╰", border),
+        Span::styled(msg.to_string(), Style::default().fg(CLR_FOOTER)),
+        Span::styled(format!("{}╯", "─".repeat(right)), border),
+    ])
+}
+
+/// Pad with spaces or truncate to exactly `width` terminal columns.
 fn pad_truncate(s: &str, width: usize) -> String {
     let n = s.chars().count();
     if n >= width {

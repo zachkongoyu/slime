@@ -69,6 +69,7 @@ impl Blackboard {
         let _ = self.tx.try_send(self.snapshot().into());
     }
 
+    #[cfg(test)]
     pub(crate) fn get_gap(&self, gap_id: &Uuid) -> Option<Gap> {
         self.gaps.get(gap_id).map(|g| g.clone())
     }
