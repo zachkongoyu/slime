@@ -5,6 +5,7 @@ use crate::providers::{Provider, Message};
 use crate::error::ProviderError;
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
 use std::time::Duration;
+use tracing::{debug, error};
 
 pub struct OpenRouter {
     base_url: String,
@@ -84,28 +85,56 @@ impl Provider for OpenRouter {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let headers = self.build_headers()?;
 
+        debug!(url = %url, model = %self.model, "sending request to OpenRouter");
+
         let res = client
             .post(&url)
             .headers(headers)
             .json(&body)
             .send()
             .await
-            .map_err(|e| ProviderError::Request(e.to_string()))?;
+            .map_err(|e| ProviderError::Request(format!("request failed: {e}")))?;
 
         let status = res.status();
-        let text = res.text().await.map_err(|e| ProviderError::Request(e.to_string()))?;
+        let content_type = res.headers().get("content-type").and_then(|h| h.to_str().ok()).unwrap_or("unknown");
+        debug!(status = %status, content_type = %content_type, "received response from OpenRouter");
+
+        // Try to read response body as bytes first, then decode
+        let bytes = res.bytes().await
+            .map_err(|e| {
+                error!(error = %e, "error reading response body");
+                ProviderError::Request(format!("error reading response body: {e}"))
+            })?;
+
+        let text = String::from_utf8(bytes.to_vec())
+            .map_err(|e| {
+                error!(
+                    error = %e,
+                    bytes_len = bytes.len(),
+                    first_64 = %format!("{:?}", &bytes.iter().take(64).collect::<Vec<_>>()),
+                    "error decoding response body as UTF-8"
+                );
+                ProviderError::Request(format!("error decoding response body: {e}"))
+            })?;
 
         if !status.is_success() {
+            error!(status = %status, body = %text, "received error response from OpenRouter");
             return Err(ProviderError::ApiError { status: status.as_u16(), body: text });
         }
 
         let mut json: Value = serde_json::from_str(&text)
-            .map_err(|e| ProviderError::Parse(e.to_string()))?;
+            .map_err(|e| {
+                error!(error = %e, body_preview = %text.chars().take(200).collect::<String>(), "error parsing JSON response");
+                ProviderError::Parse(format!("error parsing response JSON: {e}"))
+            })?;
 
         let content = json
             .pointer_mut("/choices/0/message/content")
             .map(|v| v.take())
-            .ok_or_else(|| ProviderError::Parse("OpenRouter response missing content".into()))?;
+            .ok_or_else(|| {
+                error!(response = %json, "OpenRouter response missing expected structure");
+                ProviderError::Parse("OpenRouter response missing content".into())
+            })?;
 
         Ok(Self::extract_content_text(&content))
     }

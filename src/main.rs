@@ -14,7 +14,7 @@ async fn main() {
         )
         .init();
 
-    let provider = match OpenRouter::new(None, None) {
+    let provider = match OpenRouter::new(Some("deepseek/deepseek-v3.2".to_string()), None) {
         Ok(p) => Arc::new(p),
         Err(e) => {
             tracing::error!(error = %e, "provider not configured");
