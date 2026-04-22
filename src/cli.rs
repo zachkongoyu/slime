@@ -61,6 +61,7 @@ struct UiState {
     gap_order:         Vec<String>,
     progress:          HashMap<String, ProgressEntry>,
     evidence_count:    usize,
+    final_response:    Option<String>,
     attention_queue:   Vec<Attention>,
     attention_idx:     usize,
     input_buf:         String,
@@ -76,6 +77,7 @@ impl UiState {
             gap_order:         Vec::new(),
             progress:          HashMap::new(),
             evidence_count:    0,
+            final_response:    None,
             attention_queue:   Vec::new(),
             attention_idx:     0,
             input_buf:         String::new(),
@@ -274,7 +276,7 @@ impl Cli {
         execute!(io::stdout(), SetForegroundColor(title), SetAttribute(Attribute::Bold))?;
         print!(" Moss v0.1.0 ");
         execute!(io::stdout(), ResetColor, SetAttribute(Attribute::Reset), SetForegroundColor(border))?;
-        println!("{}╮", "─".repeat(width - 17));
+        println!("{}╮", "─".repeat(width - 18));
 
         // Logo lines
         for line in &logo {
@@ -373,10 +375,14 @@ impl Cli {
                 while let Ok(ev) = self.rx.try_recv() {
                     self.state.apply(ev);
                 }
+                self.state.final_response = match &result {
+                    Ok(response) if !response.is_empty() => Some(response.clone()),
+                    _ => None,
+                };
                 self.state.tick_frame();
-                terminal.draw(|f| render_with_footer(f, &self.state, " Press Enter to continue... "))?;
+                terminal.draw(|f| render_with_footer(f, &self.state, " Press Enter to return... "))?;
 
-                // Wait for any key before leaving
+                // Wait for Enter before leaving.
                 loop {
                     match key_rx.recv().await {
                         Some(key) => {
@@ -385,7 +391,7 @@ impl Cli {
                             {
                                 break;
                             }
-                            if matches!(key.code, KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q')) {
+                            if matches!(key.code, KeyCode::Enter) {
                                 break;
                             }
                         }
@@ -396,21 +402,7 @@ impl Cli {
                 drop(_guard); // leave alternate screen before printing
                 match result {
                     Ok(response) if !response.is_empty() => {
-                        // Print response with styled header
-                        execute!(
-                            io::stdout(),
-                            SetForegroundColor(CtColor::Rgb { r: 152, g: 195, b: 121 }),
-                            SetAttribute(Attribute::Bold)
-                        )?;
-                        println!();
-                        execute!(io::stdout(), SetForegroundColor(CtColor::Rgb { r: 88, g: 88, b: 88 }))?;
-                        println!("{}", "─".repeat(80));
-                        execute!(io::stdout(), SetForegroundColor(CtColor::Rgb { r: 152, g: 195, b: 121 }), SetAttribute(Attribute::Bold))?;
-                        println!("✔ Moss");
-                        execute!(io::stdout(), ResetColor, SetAttribute(Attribute::Reset))?;
-                        execute!(io::stdout(), SetForegroundColor(CtColor::Rgb { r: 220, g: 220, b: 220 }))?;
-                        println!("{response}");
-                        execute!(io::stdout(), ResetColor)?;
+                        print_final_response(&response)?;
                     }
                     Ok(_)  => {}
                     Err(e) => {
@@ -428,6 +420,39 @@ impl Cli {
         }
         Ok(())
     }
+}
+
+fn final_response_output(response: &str) -> Vec<String> {
+    vec![
+        String::new(),
+        "─".repeat(80),
+        "✔ Moss".to_string(),
+        response.to_string(),
+    ]
+}
+
+fn print_final_response(response: &str) -> io::Result<()> {
+    execute!(
+        io::stdout(),
+        SetForegroundColor(CtColor::Rgb { r: 152, g: 195, b: 121 }),
+        SetAttribute(Attribute::Bold)
+    )?;
+
+    let lines = final_response_output(response);
+    println!();
+    execute!(io::stdout(), SetForegroundColor(CtColor::Rgb { r: 88, g: 88, b: 88 }))?;
+    println!("{}", lines[1]);
+    execute!(
+        io::stdout(),
+        SetForegroundColor(CtColor::Rgb { r: 152, g: 195, b: 121 }),
+        SetAttribute(Attribute::Bold)
+    )?;
+    println!("{}", lines[2]);
+    execute!(io::stdout(), ResetColor, SetAttribute(Attribute::Reset))?;
+    execute!(io::stdout(), SetForegroundColor(CtColor::Rgb { r: 220, g: 220, b: 220 }))?;
+    println!("{}", lines[3]);
+    execute!(io::stdout(), ResetColor)?;
+    Ok(())
 }
 
 // ── Rendering ─────────────────────────────────────────────────────────────────
@@ -561,6 +586,21 @@ fn build_lines(state: &UiState, w: usize, footer: Option<&str>) -> Vec<Line<'sta
                     lines.push(styled_row_input(w, "answer", &state.input_buf));
                     lines.push(styled_row_dim(w, "↑/↓ to switch | Enter to submit"));
                 }
+            }
+        }
+    }
+
+    if let Some(response) = state.final_response.as_deref() {
+        lines.push(styled_box_sep(w, " Response "));
+        let inner = w.saturating_sub(2);
+        for source_line in response.lines() {
+            if source_line.is_empty() {
+                lines.push(styled_box_row_empty(w));
+                continue;
+            }
+
+            for wrapped in wrap_text(source_line, inner.saturating_sub(1)) {
+                lines.push(styled_row_value(w, &format!(" {wrapped}")));
             }
         }
     }
@@ -728,7 +768,7 @@ fn styled_row_phase(w: usize, value: &str, is_complete: bool) -> Line<'static> {
         Style::default().fg(CLR_RUNNING).add_modifier(Modifier::BOLD)
     };
 
-    let value_len = inner.saturating_sub(label.len());
+    let value_len = inner.saturating_sub(label.chars().count());
     Line::from(vec![
         Span::styled("│", border),
         Span::styled(label.to_string(), Style::default().fg(CLR_TITLE).add_modifier(Modifier::BOLD)),
@@ -803,6 +843,16 @@ fn styled_row_input(w: usize, prompt: &str, buf: &str) -> Line<'static> {
     ])
 }
 
+fn styled_row_value(w: usize, content: &str) -> Line<'static> {
+    let inner = w.saturating_sub(2);
+    let border = Style::default().fg(CLR_BORDER);
+    Line::from(vec![
+        Span::styled("│", border),
+        Span::styled(pad_truncate(content, inner), Style::default().fg(CLR_VALUE)),
+        Span::styled("│", border),
+    ])
+}
+
 fn styled_row_menu_item(w: usize, prefix: &str, label: &str, is_selected: bool) -> Line<'static> {
     let inner = w.saturating_sub(2);
     let border = Style::default().fg(CLR_BORDER);
@@ -855,6 +905,36 @@ fn styled_box_bottom_msg(w: usize, msg: &str) -> Line<'static> {
         Span::styled(msg.to_string(), Style::default().fg(CLR_FOOTER)),
         Span::styled(format!("{}╯", "─".repeat(right)), border),
     ])
+}
+
+#[cfg(test)]
+fn welcome_banner_lines(width: usize) -> Vec<String> {
+    let logo = [
+        r"  ███╗   ███╗ ",
+        r"  ████╗ ████║ ",
+        r"  ██╔████╔██║ ",
+        r"  ██║╚██╔╝██║ ",
+        r"  ██║ ╚═╝ ██║ ",
+        r"  ╚═╝     ╚═╝ ",
+    ];
+    let title = " Moss v0.1.0 ";
+    let tagline = "  Local-first AI Operating System";
+
+    let mut lines = Vec::with_capacity(logo.len() + 3);
+    let top_prefix = format!("╭───{title}");
+    let top_fill = width.saturating_sub(top_prefix.chars().count() + 1);
+    lines.push(format!("{top_prefix}{}╮", "─".repeat(top_fill)));
+
+    for line in logo {
+        let right_pad = width.saturating_sub(2 + line.chars().count());
+        lines.push(format!("│{line}{}│", " ".repeat(right_pad)));
+    }
+
+    let tagline_pad = width.saturating_sub(2 + tagline.chars().count());
+    lines.push(format!("│{tagline}{}│", " ".repeat(tagline_pad)));
+    lines.push(format!("│{}│", " ".repeat(width.saturating_sub(2))));
+    lines.push(format!("╰{}╯", "─".repeat(width.saturating_sub(2))));
+    lines
 }
 
 /// Pad with spaces or truncate to exactly `width` terminal columns.
@@ -1018,6 +1098,62 @@ mod tests {
         let next_line = &lines[phase_idx + 1];
         assert!(!next_line.contains("intent"), "spacer row should be between phase and intent");
         assert_eq!(next_line.chars().filter(|c| !c.is_whitespace()).collect::<String>(), "││");
+    }
+
+    #[test]
+    fn phase_row_preserves_full_box_width_with_unicode_label() {
+        let width = 80;
+        let row = styled_row_phase(width, "✓ complete", true);
+        let text = row
+            .spans
+            .into_iter()
+            .map(|span| span.content.to_string())
+            .collect::<String>();
+
+        assert_eq!(text.chars().count(), width);
+    }
+
+    #[test]
+    fn welcome_banner_top_border_preserves_full_width() {
+        let width = 80;
+        let lines = welcome_banner_lines(width);
+
+        assert_eq!(lines[0].chars().count(), width);
+    }
+
+    #[test]
+    fn build_lines_shows_final_response_before_footer() {
+        let mut state = UiState::new("query".to_string());
+        state.final_response = Some("All gaps resolved.".to_string());
+
+        let lines = build_lines(&state, 80, Some(" Press Enter to return... "))
+            .into_iter()
+            .map(|line| {
+                line.spans
+                    .into_iter()
+                    .map(|span| span.content.to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+
+        let response_idx = lines
+            .iter()
+            .position(|line| line.contains("All gaps resolved."))
+            .unwrap_or(usize::MAX);
+        let footer_idx = lines
+            .iter()
+            .position(|line| line.contains("Press Enter to return"))
+            .unwrap_or(usize::MAX);
+
+        assert!(response_idx < footer_idx, "final response should render before the footer");
+    }
+
+    #[test]
+    fn final_response_output_includes_chat_header_and_body() {
+        let lines = final_response_output("All gaps resolved.");
+
+        assert!(lines.iter().any(|line| line.contains("✔ Moss")));
+        assert!(lines.iter().any(|line| line.contains("All gaps resolved.")));
     }
 
     #[test]
