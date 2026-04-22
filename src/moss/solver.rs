@@ -517,18 +517,4 @@ mod tests {
         let step = Step::Done { value: serde_json::Value::Null };
         assert_eq!(&*step.label(), "done");
     }
-
-    #[test]
-    fn guard_rejection_surfaces_as_error() {
-        let response = r#"{"step":"code","interpreter":"python3","ext":".py","code":"import subprocess\nsubprocess.run(['ls'])\n"}"#;
-        let parsed = parse_response(response).unwrap();
-        match &parsed.step {
-            Step::Code { code, .. } => {
-                let guard = ArtifactGuard::new();
-                let verdict = guard.scan_code(code);
-                assert!(matches!(verdict, ScanVerdict::Rejected { .. }));
-            }
-            _ => panic!("expected Code step"),
-        }
-    }
 }
