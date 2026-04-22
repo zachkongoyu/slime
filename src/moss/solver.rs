@@ -118,7 +118,7 @@ impl Solver {
             let parsed: SolverResponse = match parse_response(&response) {
                 Ok(r) => r,
                 Err(_) => {
-                    warn!(gap = %gap.name(), iteration, "unparseable response — re-prompting");
+                    // warn!(gap = %gap.name(), iteration, "unparseable response — re-prompting");
                     last_output = Some(
                         "ERROR: your previous response was not valid JSON. Respond with a single JSON object: {\"step\":\"code\",...}, {\"step\":\"ask\",...}, or {\"step\":\"done\",...}".into()
                     );

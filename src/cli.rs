@@ -29,6 +29,20 @@ enum Attention {
     Question { gap_name: String, question: String, tx: oneshot::Sender<String> },
 }
 
+impl Attention {
+    #[allow(dead_code)]
+    fn gap_name(&self) -> &str {
+        match self {
+            Self::Approval { gap_name, .. } => gap_name,
+            Self::Question { gap_name, .. } => gap_name,
+        }
+    }
+
+    fn is_approval(&self) -> bool {
+        matches!(self, Self::Approval { .. })
+    }
+}
+
 // ── Progress entry (CLI concern) ──────────────────────────────────────────────
 
 struct ProgressEntry {
@@ -41,34 +55,85 @@ struct ProgressEntry {
 // ── UI state ──────────────────────────────────────────────────────────────────
 
 struct UiState {
-    query:          String,
-    phase:          String,
-    snapshot:       Option<BlackboardSnapshot>,
-    gap_order:      Vec<String>,
-    progress:       HashMap<String, ProgressEntry>,
-    evidence_count: usize,
-    attention:      Option<Attention>,
-    input_buf:      String,
-    frame:          u32,
+    query:             String,
+    phase:             String,
+    snapshot:          Option<BlackboardSnapshot>,
+    gap_order:         Vec<String>,
+    progress:          HashMap<String, ProgressEntry>,
+    evidence_count:    usize,
+    attention_queue:   Vec<Attention>,
+    attention_idx:     usize,
+    input_buf:         String,
+    frame:             u32,
 }
 
 impl UiState {
     fn new(query: String) -> Self {
         Self {
             query,
-            phase:          "starting".to_string(),
-            snapshot:       None,
-            gap_order:      Vec::new(),
-            progress:       HashMap::new(),
-            evidence_count: 0,
-            attention:      None,
-            input_buf:      String::new(),
-            frame:          0,
+            phase:             "starting".to_string(),
+            snapshot:          None,
+            gap_order:         Vec::new(),
+            progress:          HashMap::new(),
+            evidence_count:    0,
+            attention_queue:   Vec::new(),
+            attention_idx:     0,
+            input_buf:         String::new(),
+            frame:             0,
         }
     }
 
     fn tick_frame(&mut self) {
         self.frame = self.frame.wrapping_add(1);
+    }
+
+    /// Get the currently selected attention item, if any.
+    fn current_attention(&self) -> Option<&Attention> {
+        if self.attention_idx < self.attention_queue.len() {
+            Some(&self.attention_queue[self.attention_idx])
+        } else {
+            None
+        }
+    }
+
+    /// Get the currently selected attention item mutably, if any.
+    #[allow(dead_code)]
+    fn current_attention_mut(&mut self) -> Option<&mut Attention> {
+        if self.attention_idx < self.attention_queue.len() {
+            Some(&mut self.attention_queue[self.attention_idx])
+        } else {
+            None
+        }
+    }
+
+    /// Move to the next attention item.
+    fn attention_next(&mut self) {
+        if !self.attention_queue.is_empty() && self.attention_idx + 1 < self.attention_queue.len() {
+            self.attention_idx += 1;
+            self.input_buf.clear();
+        }
+    }
+
+    /// Move to the previous attention item.
+    fn attention_prev(&mut self) {
+        if self.attention_idx > 0 {
+            self.attention_idx -= 1;
+            self.input_buf.clear();
+        }
+    }
+
+    /// Remove the currently selected attention item and move to the next, or the previous if at end.
+    fn attention_pop_current(&mut self) -> Option<Attention> {
+        if self.attention_idx < self.attention_queue.len() {
+            let item = self.attention_queue.remove(self.attention_idx);
+            if self.attention_idx >= self.attention_queue.len() && self.attention_idx > 0 {
+                self.attention_idx -= 1;
+            }
+            self.input_buf.clear();
+            Some(item)
+        } else {
+            None
+        }
     }
 
     fn apply(&mut self, ev: Event) {
@@ -98,7 +163,7 @@ impl UiState {
                 });
             }
             Event::Approval { gap_name, reason, tx, .. } => {
-                self.attention = Some(Attention::Approval {
+                self.attention_queue.push(Attention::Approval {
                     gap_name: gap_name.to_string(),
                     reason:   reason.to_string(),
                     tx,
@@ -106,7 +171,7 @@ impl UiState {
                 self.input_buf.clear();
             }
             Event::Question { gap_name, question, tx, .. } => {
-                self.attention = Some(Attention::Question {
+                self.attention_queue.push(Attention::Question {
                     gap_name: gap_name.to_string(),
                     question: question.to_string(),
                     tx,
@@ -117,17 +182,20 @@ impl UiState {
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
-        if self.attention.is_none() { return; }
+        if self.attention_queue.is_empty() { return; }
         if matches!(key.kind, KeyEventKind::Release) { return; }
         match key.code {
+            KeyCode::Up => { self.attention_prev(); }
+            KeyCode::Down => { self.attention_next(); }
             KeyCode::Backspace => { self.input_buf.pop(); }
             KeyCode::Char(c)   => { self.input_buf.push(c); }
             KeyCode::Enter     => {
                 let buf = self.input_buf.drain(..).collect::<String>();
-                match self.attention.take() {
-                    Some(Attention::Approval { tx, .. }) => { let _ = tx.send(buf.trim().eq_ignore_ascii_case("y")); }
-                    Some(Attention::Question { tx, .. }) => { let _ = tx.send(buf.trim().to_string()); }
-                    None => {}
+                if let Some(item) = self.attention_pop_current() {
+                    match item {
+                        Attention::Approval { tx, .. } => { let _ = tx.send(buf.trim().eq_ignore_ascii_case("y")); }
+                        Attention::Question { tx, .. } => { let _ = tx.send(buf.trim().to_string()); }
+                    }
                 }
             }
             _ => {}
@@ -429,8 +497,8 @@ fn build_lines(state: &UiState, w: usize, footer: Option<&str>) -> Vec<Line<'sta
     let done     = gaps_snap.iter().filter(|g| *g.state() == GapState::Closed).count();
     lines.push(styled_row_states(w, blocked, ready, assigned, done));
 
-    let pending_a = usize::from(matches!(state.attention, Some(Attention::Approval { .. })));
-    let pending_q = usize::from(matches!(state.attention, Some(Attention::Question { .. })));
+    let pending_a = state.attention_queue.iter().filter(|a| a.is_approval()).count();
+    let pending_q = state.attention_queue.len() - pending_a;
     lines.push(styled_row_kv(w, "pending", &format!(
         "{pending_a} approvals | {pending_q} questions | {} evidence",
         state.evidence_count
@@ -452,29 +520,47 @@ fn build_lines(state: &UiState, w: usize, footer: Option<&str>) -> Vec<Line<'sta
         }
     }
 
-    // Attention
-    if let Some(ref attn) = state.attention {
+    // Attention queue
+    if !state.attention_queue.is_empty() {
         lines.push(styled_box_sep_warn(w, " Attention "));
-        match attn {
-            Attention::Approval { gap_name, reason, .. } => {
-                lines.push(styled_row_warn(w, &format!("Approval needed: {gap_name}")));
-                lines.push(styled_row_kv(w, "reason", reason));
-                lines.push(styled_row_input(w, "approve? [y/N]", &state.input_buf));
-            }
-            Attention::Question { gap_name, question, .. } => {
-                let inner = w.saturating_sub(2);
-                let prefix = format!(" {gap_name} asks: ");
-                let available = inner.saturating_sub(prefix.len());
-                
-                let wrapped = wrap_text(question, available);
-                for (idx, line_text) in wrapped.iter().enumerate() {
-                    if idx == 0 {
-                        lines.push(styled_row_warn(w, &format!("{gap_name} asks: {line_text}")));
-                    } else {
-                        lines.push(styled_row_warn(w, &format!("  {line_text}")));
-                    }
+        
+        // Show all pending items as a numbered menu
+        for (idx, attn) in state.attention_queue.iter().enumerate() {
+            let is_selected = idx == state.attention_idx;
+            let prefix = if is_selected { "►" } else { " " };
+            let item_label = match attn {
+                Attention::Approval { gap_name, .. } => format!("[{}] {gap_name} — approval", idx + 1),
+                Attention::Question { gap_name, .. } => format!("[{}] {gap_name} — question", idx + 1),
+            };
+            lines.push(styled_row_menu_item(w, prefix, &item_label, is_selected));
+        }
+        
+        // Show details of the selected item
+        if let Some(attn) = state.current_attention() {
+            lines.push(styled_box_row_empty(w));
+            match attn {
+                Attention::Approval { gap_name, reason, .. } => {
+                    lines.push(styled_row_warn(w, &format!("Approval needed: {gap_name}")));
+                    lines.push(styled_row_kv(w, "reason", reason));
+                    lines.push(styled_row_input(w, "approve? [y/N]", &state.input_buf));
+                    lines.push(styled_row_dim(w, "↑/↓ to switch | Enter to submit"));
                 }
-                lines.push(styled_row_input(w, "answer", &state.input_buf));
+                Attention::Question { gap_name, question, .. } => {
+                    let inner = w.saturating_sub(2);
+                    let prefix = format!(" {gap_name} asks: ");
+                    let available = inner.saturating_sub(prefix.len());
+                    
+                    let wrapped = wrap_text(question, available);
+                    for (line_idx, line_text) in wrapped.iter().enumerate() {
+                        if line_idx == 0 {
+                            lines.push(styled_row_warn(w, &format!("{gap_name} asks: {line_text}")));
+                        } else {
+                            lines.push(styled_row_warn(w, &format!("  {line_text}")));
+                        }
+                    }
+                    lines.push(styled_row_input(w, "answer", &state.input_buf));
+                    lines.push(styled_row_dim(w, "↑/↓ to switch | Enter to submit"));
+                }
             }
         }
     }
@@ -717,6 +803,22 @@ fn styled_row_input(w: usize, prompt: &str, buf: &str) -> Line<'static> {
     ])
 }
 
+fn styled_row_menu_item(w: usize, prefix: &str, label: &str, is_selected: bool) -> Line<'static> {
+    let inner = w.saturating_sub(2);
+    let border = Style::default().fg(CLR_BORDER);
+    let item_color = if is_selected {
+        Style::default().fg(CLR_WARN).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(CLR_LABEL)
+    };
+    let item_text = format!(" {prefix} {label}");
+    Line::from(vec![
+        Span::styled("│", border),
+        Span::styled(pad_truncate(&item_text, inner), item_color),
+        Span::styled("│", border),
+    ])
+}
+
 fn styled_box_row_empty(w: usize) -> Line<'static> {
     let inner = w.saturating_sub(2);
     let border = Style::default().fg(CLR_BORDER);
@@ -834,7 +936,7 @@ mod tests {
     fn ignores_release_events_while_collecting_answer_input() {
         let (tx, _rx) = oneshot::channel();
         let mut state = UiState::new("query".to_string());
-        state.attention = Some(Attention::Question {
+        state.attention_queue.push(Attention::Question {
             gap_name: "gap".to_string(),
             question: "question".to_string(),
             tx,
